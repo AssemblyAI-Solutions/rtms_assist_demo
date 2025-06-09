@@ -1,64 +1,203 @@
 import rtms from "@zoom/rtms";
-
 import fs from "fs";
 import { exec } from "child_process";
 import { promisify } from "util";
+import WebSocket from "ws";
+import querystring from "querystring";
 
 const execAsync = promisify(exec);
 let audioChunks = [];
-let rtmsClient = null; // Single declaration of the client variable
+let rtmsClient = null;
+let streamingWs = null;
+let stopRequested = false;
 
-import { AssemblyAI } from "assemblyai";
+// Audio buffering for streaming
+let audioBuffer = [];
+const SAMPLE_RATE = 16000;
+const CHANNELS = 1;
+const BYTES_PER_SAMPLE = 2; // 16-bit audio
+const TARGET_CHUNK_DURATION_MS = 100; // 100ms chunks (within 50-1000ms range)
+const TARGET_CHUNK_SIZE = (SAMPLE_RATE * CHANNELS * BYTES_PER_SAMPLE * TARGET_CHUNK_DURATION_MS) / 1000;
 
-const client = new AssemblyAI({
-  apiKey: process.env.ASSEMBLYAI_API_KEY,
-});
+// New v3 Streaming Configuration
+const CONNECTION_PARAMS = {
+  sample_rate: SAMPLE_RATE,
+  format_turns: true, // Request formatted final transcripts
+};
+const API_ENDPOINT_BASE_URL = "wss://streaming.assemblyai.com/v3/ws";
+const API_ENDPOINT = `${API_ENDPOINT_BASE_URL}?${querystring.stringify(CONNECTION_PARAMS)}`;
 
-const SAMPLE_RATE = 16_000;
-const transcriber = client.realtime.transcriber({
-  sampleRate: SAMPLE_RATE,
-});
-
-transcriber.on("open", ({ sessionId }) => {
-  console.log(`Session opened with ID: ${sessionId}`);
-});
-
-transcriber.on("error", (error) => {
-  console.error("Error:", error);
-});
-
-transcriber.on("close", (code, reason) => {
-  console.log("Session closed:", code, reason);
-});
-
-transcriber.on("transcript", (transcript) => {
-  if (!transcript.text) {
-    return;
+function initializeStreamingTranscription() {
+  if (streamingWs) {
+    streamingWs.close();
   }
 
-  if (transcript.message_type === "PartialTranscript") {
-    // console.log("Partial:", transcript.text);
-    return;
-  } else {
-    console.log("Final:", transcript.text);
-  }
-});
+  // Reset audio buffer
+  audioBuffer = [];
 
-await transcriber.connect();
+  streamingWs = new WebSocket(API_ENDPOINT, {
+    headers: {
+      Authorization: process.env.ASSEMBLYAI_API_KEY,
+    },
+  });
+
+  streamingWs.on("open", () => {
+    console.log("Streaming WebSocket connection opened.");
+    console.log(`Connected to: ${API_ENDPOINT}`);
+    console.log(`Target chunk size: ${TARGET_CHUNK_SIZE} bytes (${TARGET_CHUNK_DURATION_MS}ms)`);
+  });
+
+  streamingWs.on("message", (message) => {
+    try {
+      const data = JSON.parse(message);
+      const msgType = data.type;
+
+      if (msgType === "Begin") {
+        const sessionId = data.id;
+        const expiresAt = data.expires_at;
+        console.log(
+          `Session began: ID=${sessionId}, ExpiresAt=${new Date(expiresAt * 1000).toISOString()}`
+        );
+      } else if (msgType === "Turn") {
+        const transcript = data.transcript || "";
+        const formatted = data.turn_is_formatted;
+
+        if (formatted) {
+          // Clear line and print final transcript
+          process.stdout.write('\r' + ' '.repeat(80) + '\r');
+          console.log("Real-time Final:", transcript);
+        } else {
+          // Show partial transcript
+          process.stdout.write(`\rReal-time Partial: ${transcript}`);
+        }
+      } else if (msgType === "Termination") {
+        const audioDuration = data.audio_duration_seconds;
+        const sessionDuration = data.session_duration_seconds;
+        console.log(
+          `\nSession Terminated: Audio Duration=${audioDuration}s, Session Duration=${sessionDuration}s`
+        );
+      }
+    } catch (error) {
+      console.error(`Error handling streaming message: ${error}`);
+      console.error(`Message data: ${message}`);
+    }
+  });
+
+  streamingWs.on("error", (error) => {
+    console.error(`Streaming WebSocket Error: ${error}`);
+    stopRequested = true;
+  });
+
+  streamingWs.on("close", (code, reason) => {
+    console.log(`Streaming WebSocket Disconnected: Status=${code}, Msg=${reason}`);
+  });
+}
+
+function sendBufferedAudio(data) {
+  // Add incoming audio data to buffer
+  audioBuffer.push(data);
+  
+  // Calculate total buffered size
+  const totalBufferedSize = audioBuffer.reduce((sum, chunk) => sum + chunk.length, 0);
+  
+  // If we have enough data, send it to streaming API
+  if (totalBufferedSize >= TARGET_CHUNK_SIZE) {
+    // Combine buffered chunks
+    const combinedBuffer = Buffer.concat(audioBuffer);
+    
+    // Send the target chunk size
+    const chunkToSend = combinedBuffer.subarray(0, TARGET_CHUNK_SIZE);
+    
+    // Keep remaining data in buffer
+    const remainingData = combinedBuffer.subarray(TARGET_CHUNK_SIZE);
+    audioBuffer = remainingData.length > 0 ? [remainingData] : [];
+    
+    // Send to streaming API
+    if (streamingWs && streamingWs.readyState === WebSocket.OPEN && !stopRequested) {
+      try {
+        streamingWs.send(chunkToSend);
+        // console.log(`Sent ${chunkToSend.length} bytes (${(chunkToSend.length / (SAMPLE_RATE * CHANNELS * BYTES_PER_SAMPLE) * 1000).toFixed(1)}ms) to streaming API`);
+      } catch (error) {
+        console.error("Error sending audio to streaming transcription:", error);
+      }
+    }
+  }
+}
+
+function flushAudioBuffer() {
+  // Send any remaining audio data when the meeting ends
+  if (audioBuffer.length > 0) {
+    const combinedBuffer = Buffer.concat(audioBuffer);
+    
+    // Only send if it's at least 50ms (minimum requirement)
+    const minChunkSize = (SAMPLE_RATE * CHANNELS * BYTES_PER_SAMPLE * 50) / 1000;
+    
+    if (combinedBuffer.length >= minChunkSize && streamingWs && streamingWs.readyState === WebSocket.OPEN) {
+      try {
+        streamingWs.send(combinedBuffer);
+        console.log(`Flushed remaining ${combinedBuffer.length} bytes (${(combinedBuffer.length / (SAMPLE_RATE * CHANNELS * BYTES_PER_SAMPLE) * 1000).toFixed(1)}ms) to streaming API`);
+      } catch (error) {
+        console.error("Error flushing audio buffer:", error);
+      }
+    }
+    
+    audioBuffer = [];
+  }
+}
+
+function cleanupStreamingTranscription() {
+  stopRequested = true;
+  
+  // Flush any remaining audio data
+  flushAudioBuffer();
+  
+  if (streamingWs && [WebSocket.OPEN, WebSocket.CONNECTING].includes(streamingWs.readyState)) {
+    try {
+      // Send termination message if possible
+      if (streamingWs.readyState === WebSocket.OPEN) {
+        const terminateMessage = { type: "Terminate" };
+        console.log(`Sending termination message: ${JSON.stringify(terminateMessage)}`);
+        streamingWs.send(JSON.stringify(terminateMessage));
+      }
+      
+      // Give a moment for final messages to process
+      setTimeout(() => {
+        if (streamingWs) {
+          streamingWs.close();
+          streamingWs = null;
+        }
+      }, 1000);
+    } catch (error) {
+      console.error(`Error closing streaming WebSocket: ${error}`);
+    }
+  }
+  
+  // Reset buffer
+  audioBuffer = [];
+}
 
 rtms.onWebhookEvent(({ event, payload }) => {
   console.log(event, payload);
 
   if (event === "meeting.rtms_started") {
+    // Initialize streaming transcription
+    initializeStreamingTranscription();
+    
     rtmsClient = new rtms.Client();
 
     rtmsClient.onAudioData((data, timestamp, metadata) => {
+      // Store audio chunks for post-meeting processing
       audioChunks.push(data);
-      transcriber.sendAudio(data);
+      
+      // Buffer and send audio data to streaming transcription in real-time
+      sendBufferedAudio(data);
     });
 
     rtmsClient.join(payload);
   } else if (event === "meeting.rtms_stopped") {
+    // Clean up streaming transcription
+    cleanupStreamingTranscription();
+    
     if (audioChunks.length === 0) {
       console.error("No audio data received");
       process.exit(1);
@@ -76,21 +215,29 @@ rtms.onWebhookEvent(({ event, payload }) => {
         console.log("WAV saved: ", wavFilename);
 
         try {
+          // Optional: Still do post-meeting transcription for backup/comparison
+          console.log("Starting post-meeting transcription for backup...");
+          
+          // Using the legacy client for post-meeting transcription
+          const { AssemblyAI } = await import("assemblyai");
+          const client = new AssemblyAI({
+            apiKey: process.env.ASSEMBLYAI_API_KEY,
+          });
+          
           const transcript = await client.transcripts.transcribe({
             audio: wavFilename,
           });
 
           if (transcript.status === "error") {
-            console.error(`Transcription failed: ${transcript.error}`);
+            console.error(`Post-meeting transcription failed: ${transcript.error}`);
           } else {
-            console.log("Async transcription:\n", transcript.text);
+            console.log("Post-meeting transcription completed:\n", transcript.text);
           }
         } catch (error) {
-          console.error("Transcription error:", error);
+          console.error("Post-meeting transcription error:", error);
         } finally {
-          // Clean up resources regardless of transcription success
+          // Clean up resources
           audioChunks = [];
-          transcriber.close();
           if (rtmsClient) {
             rtmsClient.leave();
             rtmsClient = null;
@@ -102,7 +249,6 @@ rtms.onWebhookEvent(({ event, payload }) => {
       .catch((error) => {
         console.error("Error converting audio:", error);
         audioChunks = [];
-        transcriber.close();
         if (rtmsClient) {
           rtmsClient.leave();
           rtmsClient = null;
@@ -116,3 +262,31 @@ async function convertRawToWav(rawFilename, wavFilename) {
   await execAsync(command);
   fs.unlinkSync(rawFilename);
 }
+
+// Handle graceful shutdown
+process.on("SIGINT", () => {
+  console.log("\nCtrl+C received. Stopping...");
+  cleanupStreamingTranscription();
+  if (rtmsClient) {
+    rtmsClient.leave();
+  }
+  setTimeout(() => process.exit(0), 1000);
+});
+
+process.on("SIGTERM", () => {
+  console.log("\nTermination signal received. Stopping...");
+  cleanupStreamingTranscription();
+  if (rtmsClient) {
+    rtmsClient.leave();
+  }
+  setTimeout(() => process.exit(0), 1000);
+});
+
+process.on("uncaughtException", (error) => {
+  console.error(`\nUncaught exception: ${error}`);
+  cleanupStreamingTranscription();
+  if (rtmsClient) {
+    rtmsClient.leave();
+  }
+  setTimeout(() => process.exit(1), 1000);
+});

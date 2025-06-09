@@ -11,6 +11,9 @@
   "license": "MIT",
   "dependencies": {
     "@zoom/rtms": "github:zoom/rtms",
-    "assemblyai": "^4.9.0"
+    "assemblyai": "^4.13.2",
+    "mic": "^2.1.2",
+    "node-record-lpcm16": "^1.0.1",
+    "ws": "^8.18.2"
   }
 }
