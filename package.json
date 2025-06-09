@@ -10,6 +10,7 @@
   },
   "license": "MIT",
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.53.0",
     "@zoom/rtms": "github:zoom/rtms",
     "assemblyai": "^4.13.2",
     "mic": "^2.1.2",
