@@ -13,7 +13,7 @@ let rtmsClient = null;
 let streamingWs = null;
 let stopRequested = false;
 
-// Sales Analysis Setup
+// Financial Consultation Analysis Setup
 const anthropic = new Anthropic({
   apiKey: process.env.ANTHROPIC_API_KEY,
 });
@@ -21,17 +21,19 @@ const anthropic = new Anthropic({
 // Store conversation data
 let conversationHistory = [];
 let conversationId = null;
-let salesData = {
+let financialData = {
   summary: [],
-  bant: {
-    budget: "Not identified",
+  faint: {
+    funds: "Not identified",
     authority: "Not identified", 
+    interest: "Not identified",
     need: "Not identified",
-    timeline: "Not identified"
+    timing: "Not identified"
   },
-  companyInfo: "Not identified",
-  salesReminders: [],
-  objections: []
+  clientInfo: "Not identified",
+  advisorReminders: [],
+  concerns: [],
+  strategicQuestions: []
 };
 
 // Audio buffering for streaming
@@ -50,155 +52,202 @@ const CONNECTION_PARAMS = {
 const API_ENDPOINT_BASE_URL = "wss://streaming.assemblyai.com/v3/ws";
 const API_ENDPOINT = `${API_ENDPOINT_BASE_URL}?${querystring.stringify(CONNECTION_PARAMS)}`;
 
-// Sales Analysis Tools
+// Financial Consultation Tools
 const TOOLS = [
   {
     name: "update_summary",
-    description: "Add a new bullet point to the conversation summary when there's significant new information. Each bullet should be brief and concise. Only add a new bullet when there's meaningful new information to add.",
+    description: "Add a new bullet point to the consultation summary when there's significant new financial information. Each bullet should be brief and concise. Only add a new bullet when there's meaningful new information to add.",
     input_schema: {
       type: "object",
       properties: {
         new_point: {
           type: "string",
-          description: "A single new bullet point summarizing the latest significant development (without bullet symbol)"
+          description: "A single new bullet point summarizing the latest significant financial development (without bullet symbol)"
         }
       },
       required: ["new_point"]
     }
   },
   {
-    name: "update_bant",
-    description: "Update the BANT (Budget, Authority, Need, Timeline) qualification assessment based on the conversation",
+    name: "update_faint",
+    description: "Update the FAINT (Funds, Authority, Interest, Need, Timing) financial qualification assessment based on the consultation",
     input_schema: {
       type: "object",
       properties: {
-        budget: {
+        funds: {
           type: "string",
-          description: "Identified budget information (anything related to the customers finances) or 'Not identified'"
+          description: "Identified financial capacity, assets, income, or investment capital information, or 'Not identified'"
         },
         authority: {
           type: "string",
-          description: "Identified decision-maker information or 'Not identified'"
+          description: "Identified decision-making authority for financial decisions or 'Not identified'"
+        },
+        interest: {
+          type: "string",
+          description: "Identified level of interest in financial products/services or investment appetite, or 'Not identified'"
         },
         need: {
           type: "string",
-          description: "Identified business needs or 'Not identified'"
+          description: "Identified financial needs, goals, or problems to solve, or 'Not identified'"
         },
-        timeline: {
+        timing: {
           type: "string",
-          description: "Identified implementation timeline or 'Not identified'"
+          description: "Identified timeline for financial decisions or implementation, or 'Not identified'"
         }
       },
-      required: ["budget", "authority", "need", "timeline"]
+      required: ["funds", "authority", "interest", "need", "timing"]
     }
   },
   {
-    name: "update_company_info",
-    description: "Update information about the prospect's or customer's company when new details are discovered. Don't include information on the sales reps company.",
+    name: "update_client_info",
+    description: "Update information about the client when new personal or financial details are discovered.",
     input_schema: {
       type: "object",
       properties: {
-        companyInfo: {
+        clientInfo: {
           type: "string",
-          description: "Key information about the prospect's company. Don't include information on the sales reps company."
+          description: "Key information about the client's personal situation, family, career, or financial background."
         }
       },
-      required: ["companyInfo"]
+      required: ["clientInfo"]
     }
   },
   {
-    name: "update_sales_reminders",
-    description: "Add a new bullet point reminder when there's an important new suggestion for the sales representative. Each reminder should be brief and actionable. Only add a new bullet when there's a meaningful new reminder.",
+    name: "update_advisor_reminders",
+    description: "Add a new bullet point reminder when there's an important new suggestion for the financial advisor. Each reminder should be brief and actionable. Only add a new bullet when there's a meaningful new reminder.",
     input_schema: {
       type: "object",
       properties: {
         new_reminder: {
           type: "string",
-          description: "A single new bullet point reminder (without bullet symbol)"
+          description: "A single new bullet point reminder for the advisor (without bullet symbol)"
         }
       },
       required: ["new_reminder"]
     }
   },
   {
-    name: "update_objections",
-    description: "Add a new objection and handling strategy when a new customer concern is identified. Only add when there's a clear new objection.",
+    name: "update_concerns",
+    description: "Add a new client concern and addressing strategy when a new worry or hesitation is identified. Only add when there's a clear new concern.",
     input_schema: {
       type: "object",
       properties: {
-        new_objection: {
+        new_concern: {
           type: "object",
           properties: {
-            objection: {
+            concern: {
               type: "string",
-              description: "The new customer objection or concern (brief)"
+              description: "The new client concern or worry (brief)"
             },
-            handling_strategy: {
+            addressing_strategy: {
               type: "string",
-              description: "Suggested approach to handle this objection (brief)"
+              description: "Suggested approach to address this concern (brief)"
             }
           },
-          required: ["objection", "handling_strategy"]
+          required: ["concern", "addressing_strategy"]
         }
       },
-      required: ["new_objection"]
+      required: ["new_concern"]
+    }
+  },
+  {
+    name: "update_strategic_questions",
+    description: "Add strategic questions the advisor should ask to gather more useful information about the client's financial situation, goals, or concerns. Only add when there are clear information gaps that specific questions could fill.",
+    input_schema: {
+      type: "object",
+      properties: {
+        new_question: {
+          type: "object",
+          properties: {
+            question: {
+              type: "string",
+              description: "A specific, actionable question the advisor should ask (brief)"
+            },
+            purpose: {
+              type: "string",
+              description: "Why this question would be valuable - what information it would reveal (brief)"
+            }
+          },
+          required: ["question", "purpose"]
+        }
+      },
+      required: ["new_question"]
     }
   }
 ];
 
 function getSystemPrompt(callContext) {
-  return `You are an expert sales analyst monitoring an ongoing sales conversation in real-time. 
-    Your role is to provide valuable insights to the sales representative by analyzing the conversation as it unfolds. 
-    Only make updates that help the sales rep. The insights you are providing should be regarding the customer.
+  return `You are an expert financial consultation analyst monitoring an ongoing financial advisory conversation in real-time. 
+    Your role is to provide valuable insights to the financial advisor by analyzing the consultation as it unfolds. 
+    Only make updates that help the advisor better serve their client. The insights you are providing should be regarding the client.
 
-    The conversation may or may not be labeled with speakers (Sales Rep: or Customer:) to help you understand who is speaking.
+    The conversation may or may not be labeled with speakers (Advisor: or Client:) to help you understand who is speaking.
     If the conversations is not labeled, do your best to infer who is speaking.
-    You should focus on identifying key information about the prospect, their needs, and potential opportunities while 
-    maintaining an organized understanding of the conversation's progress.
-    ${callContext ? `\nAdditional context for this specific call: ${callContext}` : ''}`;
+    You should focus on identifying key information about the client's financial situation, goals, concerns, and opportunities while 
+    maintaining an organized understanding of the consultation's progress.
+    
+    Pay special attention to:
+    - Financial capacity and assets (Funds)
+    - Decision-making authority (Authority) 
+    - Level of engagement and investment appetite (Interest)
+    - Financial goals and problems to solve (Need)
+    - Timeline for financial decisions (Timing)
+    - Client concerns, fears, or hesitations about financial products/decisions
+    - Opportunities for the advisor to provide value
+    - Information gaps where strategic questions could help gather more useful data
+    
+    ${callContext ? `\nAdditional context for this specific consultation: ${callContext}` : ''}`;
 }
 
 async function executeToolAndGetResult(toolUse) {
   switch (toolUse.name) {
     case 'update_summary':
-      salesData.summary.push(toolUse.input.new_point);
-      logSalesUpdate('SUMMARY UPDATE', toolUse.input.new_point);
+      financialData.summary.push(toolUse.input.new_point);
+      logFinancialUpdate('CONSULTATION SUMMARY UPDATE', toolUse.input.new_point);
       return {
         type: 'tool_result',
         tool_use_id: toolUse.id,
         content: "Summary point added successfully"
       };
-    case 'update_bant':
-      salesData.bant = { ...salesData.bant, ...toolUse.input };
-      logSalesUpdate('BANT UPDATE', toolUse.input);
+    case 'update_faint':
+      financialData.faint = { ...financialData.faint, ...toolUse.input };
+      logFinancialUpdate('FAINT QUALIFICATION UPDATE', toolUse.input);
       return {
         type: 'tool_result',
         tool_use_id: toolUse.id,
-        content: "BANT information updated successfully"
+        content: "FAINT information updated successfully"
       };
-    case 'update_company_info':
-      salesData.companyInfo = toolUse.input.companyInfo;
-      logSalesUpdate('COMPANY INFO UPDATE', toolUse.input.companyInfo);
+    case 'update_client_info':
+      financialData.clientInfo = toolUse.input.clientInfo;
+      logFinancialUpdate('CLIENT INFO UPDATE', toolUse.input.clientInfo);
       return {
         type: 'tool_result',
         tool_use_id: toolUse.id,
-        content: "Company information updated successfully"
+        content: "Client information updated successfully"
       };
-    case 'update_sales_reminders':
-      salesData.salesReminders.push(toolUse.input.new_reminder);
-      logSalesUpdate('SALES REMINDER', toolUse.input.new_reminder);
+    case 'update_advisor_reminders':
+      financialData.advisorReminders.push(toolUse.input.new_reminder);
+      logFinancialUpdate('ADVISOR REMINDER', toolUse.input.new_reminder);
       return {
         type: 'tool_result',
         tool_use_id: toolUse.id,
-        content: "Sales reminder added successfully"
+        content: "Advisor reminder added successfully"
       };
-    case 'update_objections':
-      salesData.objections.push(toolUse.input.new_objection);
-      logSalesUpdate('OBJECTION IDENTIFIED', toolUse.input.new_objection);
+    case 'update_concerns':
+      financialData.concerns.push(toolUse.input.new_concern);
+      logFinancialUpdate('CLIENT CONCERN IDENTIFIED', toolUse.input.new_concern);
       return {
         type: 'tool_result',
         tool_use_id: toolUse.id,
-        content: "New objection added successfully"
+        content: "New concern added successfully"
+      };
+    case 'update_strategic_questions':
+      financialData.strategicQuestions.push(toolUse.input.new_question);
+      logFinancialUpdate('STRATEGIC QUESTION SUGGESTED', toolUse.input.new_question);
+      return {
+        type: 'tool_result',
+        tool_use_id: toolUse.id,
+        content: "Strategic question added successfully"
       };
     default:
       return {
@@ -209,9 +258,9 @@ async function executeToolAndGetResult(toolUse) {
   }
 }
 
-function logSalesUpdate(type, data) {
+function logFinancialUpdate(type, data) {
   console.log('\n' + '='.repeat(60));
-  console.log(`🔥 ${type} - ${new Date().toLocaleTimeString()}`);
+  console.log(`💰 ${type} - ${new Date().toLocaleTimeString()}`);
   console.log('='.repeat(60));
   
   if (typeof data === 'object') {
@@ -223,46 +272,57 @@ function logSalesUpdate(type, data) {
   console.log('='.repeat(60) + '\n');
 }
 
-function displayCurrentSalesData() {
+function displayCurrentFinancialData() {
   console.log('\n' + '█'.repeat(80));
-  console.log('🎯 CURRENT SALES INTELLIGENCE DASHBOARD');
+  console.log('💼 FINANCIAL CONSULTATION INTELLIGENCE DASHBOARD');
   console.log('█'.repeat(80));
   
-  console.log('\n📝 CONVERSATION SUMMARY:');
-  if (salesData.summary.length > 0) {
-    salesData.summary.forEach((point, index) => {
+  console.log('\n📝 CONSULTATION SUMMARY:');
+  if (financialData.summary.length > 0) {
+    financialData.summary.forEach((point, index) => {
       console.log(`  ${index + 1}. ${point}`);
     });
   } else {
     console.log('  No key points identified yet');
   }
   
-  console.log('\n💰 BANT QUALIFICATION:');
-  console.log(`  Budget:    ${salesData.bant.budget}`);
-  console.log(`  Authority: ${salesData.bant.authority}`);
-  console.log(`  Need:      ${salesData.bant.need}`);
-  console.log(`  Timeline:  ${salesData.bant.timeline}`);
+  console.log('\n💎 FAINT QUALIFICATION:');
+  console.log(`  Funds:     ${financialData.faint.funds}`);
+  console.log(`  Authority: ${financialData.faint.authority}`);
+  console.log(`  Interest:  ${financialData.faint.interest}`);
+  console.log(`  Need:      ${financialData.faint.need}`);
+  console.log(`  Timing:    ${financialData.faint.timing}`);
   
-  console.log('\n🏢 COMPANY INFO:');
-  console.log(`  ${salesData.companyInfo}`);
+  console.log('\n👤 CLIENT INFO:');
+  console.log(`  ${financialData.clientInfo}`);
   
-  console.log('\n💡 SALES REMINDERS:');
-  if (salesData.salesReminders.length > 0) {
-    salesData.salesReminders.forEach((reminder, index) => {
+  console.log('\n💡 ADVISOR REMINDERS:');
+  if (financialData.advisorReminders.length > 0) {
+    financialData.advisorReminders.forEach((reminder, index) => {
       console.log(`  ${index + 1}. ${reminder}`);
     });
   } else {
     console.log('  No reminders yet');
   }
   
-  console.log('\n⚠️  OBJECTIONS & HANDLING:');
-  if (salesData.objections.length > 0) {
-    salesData.objections.forEach((obj, index) => {
-      console.log(`  ${index + 1}. Objection: ${obj.objection}`);
-      console.log(`     Strategy: ${obj.handling_strategy}`);
+  console.log('\n⚠️  CLIENT CONCERNS & ADDRESSING:');
+  if (financialData.concerns.length > 0) {
+    financialData.concerns.forEach((concern, index) => {
+      console.log(`  ${index + 1}. Concern: ${concern.concern}`);
+      console.log(`     Strategy: ${concern.addressing_strategy}`);
     });
   } else {
-    console.log('  No objections identified yet');
+    console.log('  No concerns identified yet');
+  }
+  
+  console.log('\n❓ STRATEGIC QUESTIONS TO ASK:');
+  if (financialData.strategicQuestions.length > 0) {
+    financialData.strategicQuestions.forEach((question, index) => {
+      console.log(`  ${index + 1}. Question: "${question.question}"`);
+      console.log(`     Purpose: ${question.purpose}`);
+    });
+  } else {
+    console.log('  No strategic questions suggested yet');
   }
   
   console.log('\n' + '█'.repeat(80) + '\n');
@@ -271,13 +331,13 @@ function displayCurrentSalesData() {
 async function processTranscript(transcript) {
   if (!transcript.trim()) return;
   
-  console.log('\n🔍 Processing transcript for sales insights...');
+  console.log('\n🔍 Processing transcript for financial consultation insights...');
   console.log(`Transcript: "${transcript}"`);
   
   try {
     const userMessage = {
       role: "user",
-      content: `New conversation segment: ${transcript}`
+      content: `New consultation segment: ${transcript}`
     };
     conversationHistory.push(userMessage);
 
@@ -346,15 +406,15 @@ async function processTranscript(transcript) {
       });
     }
 
-    // Save conversation logs
-    if (!fs.existsSync('./conversation_logs')) {
-      fs.mkdirSync('./conversation_logs');
+    // Save consultation logs
+    if (!fs.existsSync('./consultation_logs')) {
+      fs.mkdirSync('./consultation_logs');
     }
     fs.writeFileSync(
-      `./conversation_logs/${conversationId}.json`, 
+      `./consultation_logs/${conversationId}.json`, 
       JSON.stringify({
         conversationHistory,
-        salesData,
+        financialData,
         timestamp: new Date().toISOString()
       }, null, 2)
     );
@@ -403,11 +463,11 @@ function initializeStreamingTranscription() {
           process.stdout.write('\r' + ' '.repeat(80) + '\r');
           console.log("📝 Real-time Final:", transcript);
           
-          // Process transcript for sales insights
+          // Process transcript for financial consultation insights
           await processTranscript(transcript);
           
           // Display updated dashboard every few transcripts
-          displayCurrentSalesData();
+          displayCurrentFinancialData();
         } else {
           // Show partial transcript
           process.stdout.write(`\r📝 Real-time Partial: ${transcript}`);
@@ -419,9 +479,9 @@ function initializeStreamingTranscription() {
           `\n🏁 Session Terminated: Audio Duration=${audioDuration}s, Session Duration=${sessionDuration}s`
         );
         
-        // Final sales summary
-        console.log('\n🎯 FINAL SALES CALL SUMMARY:');
-        displayCurrentSalesData();
+        // Final consultation summary
+        console.log('\n💼 FINAL FINANCIAL CONSULTATION SUMMARY:');
+        displayCurrentFinancialData();
       }
     } catch (error) {
       console.error(`❌ Error handling streaming message: ${error}`);
@@ -507,25 +567,27 @@ rtms.onWebhookEvent(({ event, payload }) => {
   console.log('📡', event, payload);
 
   if (event === "meeting.rtms_started") {
-    // Initialize conversation
+    // Initialize consultation
     conversationId = payload.meeting_uuid.replace(/[^a-zA-Z0-9]/g, "_");
     conversationHistory = [];
-    salesData = {
+    financialData = {
       summary: [],
-      bant: {
-        budget: "Not identified",
+      faint: {
+        funds: "Not identified",
         authority: "Not identified", 
+        interest: "Not identified",
         need: "Not identified",
-        timeline: "Not identified"
+        timing: "Not identified"
       },
-      companyInfo: "Not identified",
-      salesReminders: [],
-      objections: []
+      clientInfo: "Not identified",
+      advisorReminders: [],
+      concerns: [],
+      strategicQuestions: []
     };
     
-    console.log('\n🚀 STARTING SALES CALL ANALYSIS');
+    console.log('\n💼 STARTING FINANCIAL CONSULTATION ANALYSIS');
     console.log(`📞 Meeting ID: ${conversationId}`);
-    console.log('🤖 AI Sales Assistant is now monitoring the conversation...\n');
+    console.log('🤖 AI Financial Assistant is now monitoring the consultation...\n');
     
     initializeStreamingTranscription();
     
@@ -540,8 +602,8 @@ rtms.onWebhookEvent(({ event, payload }) => {
   } else if (event === "meeting.rtms_stopped") {
     cleanupStreamingTranscription();
     
-    console.log('\n🏁 MEETING ENDED - GENERATING FINAL REPORT');
-    displayCurrentSalesData();
+    console.log('\n🏁 CONSULTATION ENDED - GENERATING FINAL REPORT');
+    displayCurrentFinancialData();
     
     if (audioChunks.length === 0) {
       console.error("❌ No audio data received");
@@ -560,7 +622,7 @@ rtms.onWebhookEvent(({ event, payload }) => {
         console.log("🎵 WAV saved: ", wavFilename);
 
         try {
-          console.log("📄 Starting post-meeting transcription for backup...");
+          console.log("📄 Starting post-consultation transcription for backup...");
           
           const { AssemblyAI } = await import("assemblyai");
           const client = new AssemblyAI({
@@ -572,28 +634,28 @@ rtms.onWebhookEvent(({ event, payload }) => {
           });
 
           if (transcript.status === "error") {
-            console.error(`❌ Post-meeting transcription failed: ${transcript.error}`);
+            console.error(`❌ Post-consultation transcription failed: ${transcript.error}`);
           } else {
-            console.log("✅ Post-meeting transcription completed");
+            console.log("✅ Post-consultation transcription completed");
             
             // Save final report
             const finalReport = {
               meetingId,
               timestamp: new Date().toISOString(),
-              salesData,
+              financialData,
               conversationHistory,
               fullTranscript: transcript.text
             };
             
             fs.writeFileSync(
-              `./conversation_logs/${meetingId}_final_report.json`, 
+              `./consultation_logs/${meetingId}_final_report.json`, 
               JSON.stringify(finalReport, null, 2)
             );
             
-            console.log(`📊 Final sales report saved: ./conversation_logs/${meetingId}_final_report.json`);
+            console.log(`📊 Final consultation report saved: ./consultation_logs/${meetingId}_final_report.json`);
           }
         } catch (error) {
-          console.error("❌ Post-meeting transcription error:", error);
+          console.error("❌ Post-consultation transcription error:", error);
         } finally {
           audioChunks = [];
           if (rtmsClient) {
@@ -648,6 +710,6 @@ process.on("uncaughtException", (error) => {
   setTimeout(() => process.exit(1), 1000);
 });
 
-console.log('\n🎯 ZOOM SALES INTELLIGENCE SYSTEM STARTED');
-console.log('🤖 Ready to analyze sales conversations...');
+console.log('\n💼 ZOOM FINANCIAL CONSULTATION INTELLIGENCE SYSTEM STARTED');
+console.log('🤖 Ready to analyze financial consultations...');
 console.log('💡 Make sure your ASSEMBLYAI_API_KEY and ANTHROPIC_API_KEY are set in .env\n');
