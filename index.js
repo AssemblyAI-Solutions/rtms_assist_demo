@@ -1,17 +1,35 @@
-import rtms from "@zoom/rtms";
+import express from 'express';
+import crypto from 'crypto';
+import WebSocket from 'ws';
 import fs from "fs";
 import { exec } from "child_process";
 import { promisify } from "util";
-import WebSocket from "ws";
 import querystring from "querystring";
 import { AssemblyAI } from "assemblyai";
 import Anthropic from "@anthropic-ai/sdk";
+import path from 'path';
+import { fileURLToPath } from 'url';
+import helmet from 'helmet';
+
+// Get current directory for ES modules
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const execAsync = promisify(exec);
-let audioChunks = [];
-let rtmsClient = null;
-let streamingWs = null;
-let stopRequested = false;
+
+// Zoom RTMS credentials
+const ZOOM_SECRET_TOKEN = process.env.ZOOM_SECRET_TOKEN;
+const CLIENT_ID = process.env.ZM_CLIENT_ID;
+const CLIENT_SECRET = process.env.ZM_CLIENT_SECRET;
+
+// Debug log the environment variables
+console.log('🔍 Environment Variables Check:');
+console.log('ZOOM_SECRET_TOKEN:', ZOOM_SECRET_TOKEN ? '✅ Set' : '❌ Missing');
+console.log('ZM_CLIENT_ID:', CLIENT_ID ? '✅ Set' : '❌ Missing');
+console.log('ZM_CLIENT_SECRET:', CLIENT_SECRET ? '✅ Set' : '❌ Missing');
+console.log('ASSEMBLYAI_API_KEY:', process.env.ASSEMBLYAI_API_KEY ? '✅ Set' : '❌ Missing');
+console.log('ANTHROPIC_API_KEY:', process.env.ANTHROPIC_API_KEY ? '✅ Set' : '❌ Missing');
+console.log('');
 
 // Financial Consultation Analysis Setup
 const anthropic = new Anthropic({
@@ -36,21 +54,61 @@ let financialData = {
   strategicQuestions: []
 };
 
-// Audio buffering for streaming
-let audioBuffer = [];
+// Global transcript storage
+global.liveTranscripts = [];
+
+// Audio streaming configuration
 const SAMPLE_RATE = 16000;
 const CHANNELS = 1;
 const BYTES_PER_SAMPLE = 2;
 const TARGET_CHUNK_DURATION_MS = 100;
 const TARGET_CHUNK_SIZE = (SAMPLE_RATE * CHANNELS * BYTES_PER_SAMPLE * TARGET_CHUNK_DURATION_MS) / 1000;
 
-// New v3 Streaming Configuration
+// Keep track of active connections and audio collectors per meeting
+const activeConnections = new Map();
+const audioCollectors = new Map();
+
+// AssemblyAI v3 Streaming Configuration
 const CONNECTION_PARAMS = {
   sample_rate: SAMPLE_RATE,
   format_turns: true,
 };
 const API_ENDPOINT_BASE_URL = "wss://streaming.assemblyai.com/v3/ws";
 const API_ENDPOINT = `${API_ENDPOINT_BASE_URL}?${querystring.stringify(CONNECTION_PARAMS)}`;
+
+// Initialize Express app
+const app = express();
+const PORT = 8080;
+
+// Security middleware with helmet
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      scriptSrc: ["'self'", "'unsafe-inline'"],
+      styleSrc: ["'self'", "'unsafe-inline'"],
+      imgSrc: ["'self'", "data:", "https:"],
+      connectSrc: ["'self'"],
+      fontSrc: ["'self'"],
+      objectSrc: ["'none'"],
+      mediaSrc: ["'self'"],
+      frameSrc: ["'none'"],
+    },
+  },
+  hsts: {
+    maxAge: 31536000,
+    includeSubDomains: true,
+    preload: true
+  },
+  referrerPolicy: {
+    policy: "strict-origin-when-cross-origin"
+  }
+}));
+
+// Regular middleware
+app.use(express.static('public'));
+app.use(express.json());
+app.use(express.raw({type: 'application/json'}));
 
 // Financial Consultation Tools
 const TOOLS = [
@@ -176,6 +234,1058 @@ const TOOLS = [
   }
 ];
 
+// Single simplified dashboard route
+app.get('/', (req, res) => {
+  res.send(`
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Financial Consultation Intelligence System</title>
+        <style>
+            * {
+                margin: 0;
+                padding: 0;
+                box-sizing: border-box;
+            }
+            
+            body {
+                font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, sans-serif;
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                color: #333;
+                height: 100vh;
+                overflow: hidden;
+            }
+            
+            .container {
+                height: 100vh;
+                display: flex;
+                flex-direction: column;
+                max-width: 1400px;
+                margin: 0 auto;
+                background: rgba(255, 255, 255, 0.95);
+                backdrop-filter: blur(10px);
+                box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1);
+            }
+            
+            .header {
+                background: linear-gradient(135deg, #2c3e50 0%, #34495e 100%);
+                color: white;
+                padding: 20px 30px;
+                box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+            }
+            
+            .header h1 {
+                font-size: 1.8em;
+                font-weight: 600;
+                text-align: center;
+                margin: 0;
+                text-shadow: 0 2px 4px rgba(0, 0, 0, 0.3);
+            }
+            
+            .status-bar {
+                background: linear-gradient(135deg, #34495e 0%, #2c3e50 100%);
+                color: white;
+                padding: 12px 30px;
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+                gap: 20px;
+                font-size: 0.9em;
+                border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+            }
+            
+            .status-item {
+                display: flex;
+                align-items: center;
+                gap: 8px;
+            }
+            
+            .status-label {
+                opacity: 0.8;
+            }
+            
+            .status-value {
+                font-weight: 600;
+            }
+            
+            .tabs {
+                display: flex;
+                background: #f8f9fa;
+                border-bottom: 2px solid #e9ecef;
+            }
+            
+            .tab {
+                flex: 1;
+                padding: 16px 24px;
+                text-align: center;
+                cursor: pointer;
+                background: linear-gradient(135deg, #f8f9fa 0%, #e9ecef 100%);
+                border-right: 1px solid #dee2e6;
+                transition: all 0.3s ease;
+                font-weight: 500;
+                color: #495057;
+            }
+            
+            .tab:last-child {
+                border-right: none;
+            }
+            
+            .tab.active {
+                background: linear-gradient(135deg, #007bff 0%, #0056b3 100%);
+                color: white;
+                box-shadow: 0 2px 8px rgba(0, 123, 255, 0.3);
+            }
+            
+            .tab:hover:not(.active) {
+                background: linear-gradient(135deg, #e9ecef 0%, #dee2e6 100%);
+                transform: translateY(-1px);
+            }
+            
+            .tab-content {
+                display: none;
+                flex: 1;
+                overflow: hidden;
+            }
+            
+            .tab-content.active {
+                display: flex;
+                flex-direction: column;
+            }
+            
+            .dashboard-container {
+                flex: 1;
+                overflow-y: auto;
+                padding: 24px;
+                background: #f8f9fa;
+            }
+            
+            .dashboard-section {
+                background: white;
+                border-radius: 12px;
+                padding: 20px;
+                margin-bottom: 20px;
+                box-shadow: 0 2px 12px rgba(0, 0, 0, 0.08);
+                border: 1px solid #e9ecef;
+                transition: transform 0.2s ease, box-shadow 0.2s ease;
+            }
+            
+            .dashboard-section:hover {
+                transform: translateY(-2px);
+                box-shadow: 0 4px 20px rgba(0, 0, 0, 0.12);
+            }
+            
+            .section-title {
+                font-size: 1.1em;
+                font-weight: 600;
+                color: #2c3e50;
+                margin-bottom: 16px;
+                padding-bottom: 8px;
+                border-bottom: 2px solid #e9ecef;
+                display: flex;
+                align-items: center;
+                gap: 8px;
+            }
+            
+            .faint-grid {
+                display: grid;
+                grid-template-columns: 120px 1fr;
+                gap: 12px 20px;
+                align-items: start;
+            }
+            
+            .faint-label {
+                font-weight: 600;
+                color: #495057;
+                display: flex;
+                align-items: center;
+                gap: 6px;
+            }
+            
+            .faint-value {
+                color: #2c3e50;
+                padding: 8px 12px;
+                background: #f8f9fa;
+                border-radius: 6px;
+                border-left: 3px solid #007bff;
+            }
+            
+            .list-item {
+                margin: 8px 0;
+                padding: 12px 16px;
+                background: #f8f9fa;
+                border-radius: 8px;
+                border-left: 4px solid #28a745;
+                color: #2c3e50;
+                line-height: 1.5;
+            }
+            
+            .concern-item {
+                margin: 12px 0;
+                padding: 16px;
+                background: linear-gradient(135deg, #fff5f5 0%, #fed7d7 20%);
+                border-radius: 8px;
+                border-left: 4px solid #e53e3e;
+            }
+            
+            .concern-item strong {
+                color: #c53030;
+            }
+            
+            .question-item {
+                margin: 12px 0;
+                padding: 16px;
+                background: linear-gradient(135deg, #ebf8ff 0%, #bee3f8 20%);
+                border-radius: 8px;
+                border-left: 4px solid #3182ce;
+            }
+            
+            .question-item strong {
+                color: #2b6cb0;
+            }
+            
+            .transcript-container {
+                flex: 1;
+                background: #1a202c;
+                color: #e2e8f0;
+                font-family: 'SF Mono', 'Monaco', 'Inconsolata', 'Roboto Mono', monospace;
+                padding: 20px;
+                overflow-y: auto;
+                margin: 0;
+            }
+            
+            .transcript-entry {
+                margin: 8px 0;
+                padding: 12px 16px;
+                border-left: 3px solid #4fd1c7;
+                background: rgba(79, 209, 199, 0.1);
+                border-radius: 0 8px 8px 0;
+                transition: all 0.2s ease;
+                line-height: 1.6;
+            }
+
+            .transcript-entry:hover {
+                background: rgba(79, 209, 199, 0.15);
+                transform: translateX(4px);
+            }
+
+            .transcript-timestamp {
+                color: #4fd1c7;
+                font-size: 0.85em;
+                margin-bottom: 6px;
+                font-weight: 600;
+                font-family: 'SF Mono', 'Monaco', 'Inconsolata', 'Roboto Mono', monospace;
+            }
+
+            .transcript-text {
+                color: #e2e8f0;
+                line-height: 1.6;
+                white-space: pre-wrap;
+                word-wrap: break-word;
+            }
+            
+            .status-active {
+                color: #28a745;
+                font-weight: 600;
+            }
+            
+            .status-inactive {
+                color: #dc3545;
+                font-weight: 600;
+            }
+            
+            .empty-state {
+                text-align: center;
+                color: #6c757d;
+                font-style: italic;
+                padding: 60px 20px;
+                background: white;
+                border-radius: 12px;
+                box-shadow: 0 2px 12px rgba(0, 0, 0, 0.08);
+            }
+            
+            .empty-state-transcript {
+                text-align: center;
+                color: #a0aec0;
+                font-style: italic;
+                padding: 60px 20px;
+                height: 100%;
+                display: flex;
+                flex-direction: column;
+                justify-content: center;
+                align-items: center;
+            }
+            
+            .pulse {
+                animation: pulse 2s infinite;
+            }
+            
+            @keyframes pulse {
+                0% { opacity: 1; }
+                50% { opacity: 0.5; }
+                100% { opacity: 1; }
+            }
+            
+            /* Custom scrollbar */
+            ::-webkit-scrollbar {
+                width: 8px;
+            }
+            
+            ::-webkit-scrollbar-track {
+                background: #f1f1f1;
+                border-radius: 4px;
+            }
+            
+            ::-webkit-scrollbar-thumb {
+                background: #c1c1c1;
+                border-radius: 4px;
+            }
+            
+            ::-webkit-scrollbar-thumb:hover {
+                background: #a8a8a8;
+            }
+            
+            .transcript-container::-webkit-scrollbar-track {
+                background: #2d3748;
+            }
+            
+            .transcript-container::-webkit-scrollbar-thumb {
+                background: #4a5568;
+            }
+            
+            .transcript-container::-webkit-scrollbar-thumb:hover {
+                background: #718096;
+            }
+            
+            @media (max-width: 768px) {
+                .status-bar {
+                    grid-template-columns: 1fr;
+                    gap: 10px;
+                }
+                
+                .faint-grid {
+                    grid-template-columns: 1fr;
+                    gap: 8px;
+                }
+                
+                .dashboard-container {
+                    padding: 16px;
+                }
+                
+                .header h1 {
+                    font-size: 1.4em;
+                }
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="header">
+                <h1>💼 Financial Consultation Intelligence System</h1>
+            </div>
+            
+            <div class="status-bar">
+                <div class="status-item">
+                    <span class="status-label">Status:</span>
+                    <span id="system-status" class="status-value status-inactive">🔴 STANDBY</span>
+                </div>
+                <div class="status-item">
+                    <span class="status-label">Active Meetings:</span>
+                    <span id="meeting-count" class="status-value">0</span>
+                </div>
+                <div class="status-item">
+                    <span class="status-label">AI Analysis:</span>
+                    <span id="ai-status" class="status-value status-inactive">❌ OFFLINE</span>
+                </div>
+                <div class="status-item">
+                    <span class="status-label">Last Update:</span>
+                    <span id="last-update" class="status-value">Never</span>
+                </div>
+            </div>
+
+            <div class="tabs">
+                <div class="tab active" data-tab="dashboard">
+                    📊 Financial Intelligence Dashboard
+                </div>
+                <div class="tab" data-tab="transcript">
+                    📝 Live Transcript
+                </div>
+            </div>
+
+            <div id="dashboard-tab" class="tab-content active">
+                <div class="dashboard-container">
+                    <div id="financial-dashboard">
+                        <div class="empty-state">
+                            <div class="pulse">💤</div>
+                            <h3>Waiting for consultation to begin...</h3>
+                            <p>Start a Zoom meeting with RTMS enabled to see live financial intelligence.</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div id="transcript-tab" class="tab-content">
+                <div class="transcript-container" id="transcript-container">
+                    <div class="empty-state-transcript">
+                        <div class="pulse">🎙️</div>
+                        <h3>Waiting for live transcription...</h3>
+                        <p>Transcript will appear here when the consultation begins.</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <script>
+          let transcriptData = [];
+          let isActiveCall = false;
+
+          function showTab(tabName) {
+              // Hide all tabs
+              document.querySelectorAll('.tab-content').forEach(tab => {
+                  tab.classList.remove('active');
+              });
+              document.querySelectorAll('.tab').forEach(tab => {
+                  tab.classList.remove('active');
+              });
+
+              // Show selected tab
+              document.getElementById(tabName + '-tab').classList.add('active');
+              
+              // Find and activate the clicked tab
+              if (tabName === 'dashboard') {
+                  document.querySelector('.tab:first-child').classList.add('active');
+              } else if (tabName === 'transcript') {
+                  document.querySelector('.tab:last-child').classList.add('active');
+              }
+          }
+
+          async function updateDashboard() {
+              try {
+                  // Get system status
+                  const statusResponse = await fetch('/api/status');
+                  const statusData = await statusResponse.json();
+                  
+                  // Update status bar
+                  document.getElementById('system-status').innerHTML = 
+                      statusData.status === 'active' ? 
+                      '<span class="status-active">🟢 ACTIVE</span>' : 
+                      '<span class="status-inactive">🔴 STANDBY</span>';
+                  
+                  document.getElementById('meeting-count').textContent = statusData.active_meetings;
+                  document.getElementById('ai-status').innerHTML = 
+                      statusData.features.ai_analysis ? 
+                      '<span class="status-active">✅ ONLINE</span>' : 
+                      '<span class="status-inactive">❌ OFFLINE</span>';
+                  
+                  document.getElementById('last-update').textContent = 
+                      new Date().toLocaleTimeString();
+
+                  isActiveCall = statusData.status === 'active';
+
+                  // Get financial data if call is active
+                  if (isActiveCall) {
+                      const dashResponse = await fetch('/api/dashboard');
+                      const dashData = await dashResponse.json();
+                      updateFinancialDashboard(dashData.financial_data);
+                      
+                      // Get transcript data
+                      const transcriptResponse = await fetch('/api/transcript');
+                      const transcriptDataResponse = await transcriptResponse.json();
+                      updateTranscript(transcriptDataResponse.transcripts || []);
+                  } else {
+                      // Show waiting state
+                      document.getElementById('financial-dashboard').innerHTML = \`
+                          <div class="empty-state">
+                              <div class="pulse">💤</div>
+                              <h3>Waiting for consultation to begin...</h3>
+                              <p>Start a Zoom meeting with RTMS enabled to see live financial intelligence.</p>
+                          </div>
+                      \`;
+                      
+                      document.getElementById('transcript-container').innerHTML = \`
+                          <div class="empty-state-transcript">
+                              <div class="pulse">🎙️</div>
+                              <h3>Waiting for live transcription...</h3>
+                              <p>Transcript will appear here when the consultation begins.</p>
+                          </div>
+                      \`;
+                  }
+                  
+              } catch (error) {
+                  console.error('Error updating dashboard:', error);
+              }
+          }
+
+          function updateFinancialDashboard(data) {
+              const dashboard = document.getElementById('financial-dashboard');
+              
+              dashboard.innerHTML = \`
+                  <div class="dashboard-section">
+                      <div class="section-title">📝 Consultation Summary</div>
+                      \${data.summary && data.summary.length > 0 ? 
+                          data.summary.map((point, i) => \`<div class="list-item">\${i + 1}. \${point}</div>\`).join('') :
+                          '<div style="color: #6c757d; font-style: italic; padding: 20px; text-align: center;">No key points identified yet</div>'
+                      }
+                  </div>
+
+                  <div class="dashboard-section">
+                      <div class="section-title">💎 FAINT Qualification</div>
+                      <div class="faint-grid">
+                          <div class="faint-label">💰 Funds:</div>
+                          <div class="faint-value">\${data.faint?.funds || 'Not identified'}</div>
+                          
+                          <div class="faint-label">👤 Authority:</div>
+                          <div class="faint-value">\${data.faint?.authority || 'Not identified'}</div>
+                          
+                          <div class="faint-label">🎯 Interest:</div>
+                          <div class="faint-value">\${data.faint?.interest || 'Not identified'}</div>
+                          
+                          <div class="faint-label">🎪 Need:</div>
+                          <div class="faint-value">\${data.faint?.need || 'Not identified'}</div>
+                          
+                          <div class="faint-label">⏰ Timing:</div>
+                          <div class="faint-value">\${data.faint?.timing || 'Not identified'}</div>
+                      </div>
+                  </div>
+
+                  <div class="dashboard-section">
+                      <div class="section-title">👤 Client Information</div>
+                      <div class="list-item">\${data.clientInfo || 'Not identified'}</div>
+                  </div>
+
+                  <div class="dashboard-section">
+                      <div class="section-title">💡 Advisor Reminders</div>
+                      \${data.advisorReminders && data.advisorReminders.length > 0 ? 
+                          data.advisorReminders.map((reminder, i) => \`<div class="list-item">\${i + 1}. \${reminder}</div>\`).join('') :
+                          '<div style="color: #6c757d; font-style: italic; padding: 20px; text-align: center;">No reminders yet</div>'
+                      }
+                  </div>
+
+                  <div class="dashboard-section">
+                      <div class="section-title">⚠️ Client Concerns & Addressing</div>
+                      \${data.concerns && data.concerns.length > 0 ? 
+                          data.concerns.map((concern, i) => \`
+                              <div class="concern-item">
+                                  <strong>Concern:</strong> \${concern.concern}<br><br>
+                                  <strong>Strategy:</strong> \${concern.addressing_strategy}
+                              </div>
+                          \`).join('') :
+                          '<div style="color: #6c757d; font-style: italic; padding: 20px; text-align: center;">No concerns identified yet</div>'
+                      }
+                  </div>
+
+                  <div class="dashboard-section">
+                      <div class="section-title">❓ Strategic Questions to Ask</div>
+                      \${data.strategicQuestions && data.strategicQuestions.length > 0 ? 
+                          data.strategicQuestions.map((question, i) => \`
+                              <div class="question-item">
+                                  <strong>\${i + 1}. Question:</strong> "\${question.question}"<br><br>
+                                  <strong>Purpose:</strong> \${question.purpose}
+                              </div>
+                          \`).join('') :
+                          '<div style="color: #6c757d; font-style: italic; padding: 20px; text-align: center;">No strategic questions suggested yet</div>'
+                      }
+                  </div>
+              \`;
+          }
+
+          function updateTranscript(transcripts) {
+              const container = document.getElementById('transcript-container');
+              
+              if (!transcripts || transcripts.length === 0) {
+                  container.innerHTML = \`
+                      <div class="empty-state-transcript">
+                          <div class="pulse">🎙️</div>
+                          <h3>No transcript data available yet...</h3>
+                          <p>Transcription will appear here once the conversation begins.</p>
+                      </div>
+                  \`;
+                  return;
+              }
+              
+              // Group transcripts and format with line breaks
+              const transcriptText = transcripts.map(entry => \`
+                  <div class="transcript-entry">
+                      <div class="transcript-timestamp">[\${entry.timestamp}]</div>
+                      <div class="transcript-text">\${entry.text}</div>
+                  </div>
+              \`).join('');
+              
+              container.innerHTML = transcriptText;
+              
+              // Auto-scroll to bottom
+              container.scrollTop = container.scrollHeight;
+          }
+
+          // Initial load
+          updateDashboard();
+          
+          // Auto-refresh every 2 seconds during active calls, 10 seconds during standby
+          function scheduleUpdate() {
+              const interval = isActiveCall ? 2000 : 10000;
+              setTimeout(() => {
+                  updateDashboard().then(scheduleUpdate);
+              }, interval);
+          }
+          scheduleUpdate();
+
+          // Add click event listeners after page loads
+          document.addEventListener('DOMContentLoaded', function() {
+              // Add click handlers to tabs
+              document.querySelector('.tab:first-child').addEventListener('click', function() {
+                  showTab('dashboard');
+              });
+              
+              document.querySelector('.tab:last-child').addEventListener('click', function() {
+                  showTab('transcript');
+              });
+          });
+      </script>
+    </body>
+    </html>
+  `);
+});
+
+// Add API endpoint for transcript data
+app.get('/api/transcript', (req, res) => {
+  res.json({
+    transcripts: global.liveTranscripts || [],
+    conversation_id: conversationId,
+    timestamp: new Date().toISOString()
+  });
+});
+
+// Keep the existing API routes
+app.get('/api/status', (req, res) => {
+  res.json({
+    system: 'Financial Consultation Intelligence System',
+    status: activeConnections.size > 0 ? 'active' : 'standby',
+    conversation_id: conversationId,
+    active_meetings: activeConnections.size,
+    timestamp: new Date().toISOString(),
+    features: {
+      streaming_transcription: Array.from(audioCollectors.values()).some(c => c.streamingWs?.readyState === 1),
+      ai_analysis: !!process.env.ANTHROPIC_API_KEY,
+      zoom_connection: activeConnections.size > 0
+    }
+  });
+});
+
+app.get('/api/dashboard', (req, res) => {
+  res.json({
+    conversation_id: conversationId,
+    financial_data: financialData,
+    conversation_history_length: conversationHistory.length,
+    active_meetings: activeConnections.size,
+    timestamp: new Date().toISOString()
+  });
+});
+
+// RTMS Webhook Handler
+app.post('/webhook', (req, res) => {
+    console.log('📡 RTMS Webhook received:', JSON.stringify(req.body, null, 2));
+    const { event, payload } = req.body;
+
+    if (event === 'endpoint.url_validation' && payload?.plainToken) {
+        const hash = crypto
+            .createHmac('sha256', ZOOM_SECRET_TOKEN)
+            .update(payload.plainToken)
+            .digest('hex');
+        console.log('✅ Responding to URL validation challenge');
+        return res.json({
+            plainToken: payload.plainToken,
+            encryptedToken: hash,
+        });
+    }
+
+    if (event === 'meeting.rtms_started') {
+        console.log('\n💼 STARTING FINANCIAL CONSULTATION ANALYSIS');
+        const { meeting_uuid, rtms_stream_id, server_urls } = payload;
+        
+        // Initialize consultation
+        conversationId = meeting_uuid.replace(/[^a-zA-Z0-9]/g, "_");
+        conversationHistory = [];
+        financialData = {
+          summary: [],
+          faint: {
+            funds: "Not identified",
+            authority: "Not identified", 
+            interest: "Not identified",
+            need: "Not identified",
+            timing: "Not identified"
+          },
+          clientInfo: "Not identified",
+          advisorReminders: [],
+          concerns: [],
+          strategicQuestions: []
+        };
+        
+        console.log(`📞 Meeting ID: ${conversationId}`);
+        console.log('🤖 AI Financial Assistant is now monitoring the consultation...\n');
+        
+        // Initialize audio collection and streaming for this meeting
+        initializeAudioCollection(meeting_uuid);
+        initializeAssemblyAIStreaming(meeting_uuid);
+        connectToSignalingWebSocket(meeting_uuid, rtms_stream_id, server_urls);
+    }
+
+    if (event === 'meeting.rtms_stopped') {
+        console.log('\n🏁 CONSULTATION ENDED - GENERATING FINAL REPORT');
+        const { meeting_uuid } = payload;
+        
+        cleanupMeeting(meeting_uuid);
+        displayCurrentFinancialData();
+    }
+
+    res.sendStatus(200);
+});
+
+// Audio Collection Management
+function initializeAudioCollection(meetingUuid) {
+    audioCollectors.set(meetingUuid, {
+        audioChunks: [],
+        audioBuffer: [],
+        totalBytes: 0,
+        chunkCount: 0,
+        startTime: Date.now(),
+        streamingWs: null,
+        stopRequested: false
+    });
+}
+
+function initializeAssemblyAIStreaming(meetingUuid) {
+    const collector = audioCollectors.get(meetingUuid);
+    if (!collector) return;
+
+    console.log(`🔗 Connecting to AssemblyAI streaming for meeting ${meetingUuid}`);
+
+    const streamingWs = new WebSocket(API_ENDPOINT, {
+        headers: {
+            Authorization: process.env.ASSEMBLYAI_API_KEY,
+        },
+    });
+
+    collector.streamingWs = streamingWs;
+
+    streamingWs.on('open', () => {
+        console.log(`✅ AssemblyAI streaming connected for meeting ${meetingUuid}`);
+    });
+
+    streamingWs.on('message', async (message) => {
+        try {
+            const data = JSON.parse(message);
+            await handleAssemblyAIMessage(data, meetingUuid);
+        } catch (error) {
+            console.error(`❌ AssemblyAI message error: ${error}`);
+        }
+    });
+
+    streamingWs.on('error', (error) => {
+        console.error(`❌ AssemblyAI streaming error: ${error}`);
+        collector.stopRequested = true;
+    });
+
+    streamingWs.on('close', (code, reason) => {
+        console.log(`🔌 AssemblyAI streaming closed: ${code} - ${reason}`);
+    });
+}
+
+async function handleAssemblyAIMessage(data, meetingUuid) {
+    const msgType = data.type;
+
+    if (msgType === "Begin") {
+        console.log(`🚀 AssemblyAI session started: ${data.id}`);
+        // Clear previous transcripts when new session starts
+        global.liveTranscripts = [];
+    } else if (msgType === "Turn") {
+        const transcript = data.transcript || "";
+        const formatted = data.turn_is_formatted;
+
+        if (formatted && transcript.trim()) {
+            // Final transcript - add to live transcripts
+            global.liveTranscripts.push({
+                timestamp: new Date().toLocaleTimeString(),
+                text: transcript,
+                type: 'final'
+            });
+            
+            // Keep only last 50 entries to prevent memory issues
+            if (global.liveTranscripts.length > 50) {
+                global.liveTranscripts = global.liveTranscripts.slice(-50);
+            }
+            
+            process.stdout.write('\r' + ' '.repeat(100) + '\r');
+            console.log(`📝 [${meetingUuid.substring(0, 8)}] FINAL: ${transcript}`);
+            
+            // Process transcript for financial consultation insights
+            await processTranscript(transcript);
+            
+            // Display updated dashboard
+            displayCurrentFinancialData();
+        } else if (!formatted && transcript.trim()) {
+            // Partial transcript
+            process.stdout.write(`\r🎙️  [${meetingUuid.substring(0, 8)}] ${transcript}`);
+        }
+    } else if (msgType === "Termination") {
+        console.log(`\n🏁 AssemblyAI session terminated for ${meetingUuid}`);
+        
+        // Final consultation summary
+        console.log('\n💼 FINAL FINANCIAL CONSULTATION SUMMARY:');
+        displayCurrentFinancialData();
+    }
+}
+
+// Zoom RTMS Functions
+function generateSignature(CLIENT_ID, meetingUuid, streamId, CLIENT_SECRET) {
+    console.log('🔐 Generating signature for RTMS connection');
+    const message = `${CLIENT_ID},${meetingUuid},${streamId}`;
+    return crypto.createHmac('sha256', CLIENT_SECRET).update(message).digest('hex');
+}
+
+function connectToSignalingWebSocket(meetingUuid, streamId, serverUrl) {
+    console.log(`🔌 Connecting to signaling WebSocket for meeting ${meetingUuid}`);
+
+    const ws = new WebSocket(serverUrl);
+
+    // Store connection for cleanup later
+    if (!activeConnections.has(meetingUuid)) {
+        activeConnections.set(meetingUuid, {});
+    }
+    activeConnections.get(meetingUuid).signaling = ws;
+
+    ws.on('open', () => {
+        console.log(`✅ Signaling WebSocket connection opened for meeting ${meetingUuid}`);
+        const signature = generateSignature(CLIENT_ID, meetingUuid, streamId, CLIENT_SECRET);
+
+        const handshake = {
+            msg_type: 1,
+            protocol_version: 1,
+            meeting_uuid: meetingUuid,
+            rtms_stream_id: streamId,
+            sequence: Math.floor(Math.random() * 1e9),
+            signature,
+        };
+        ws.send(JSON.stringify(handshake));
+        console.log('📤 Sent handshake to signaling server');
+    });
+
+    ws.on('message', (data) => {
+        const msg = JSON.parse(data);
+        console.log('📨 Signaling Message:', JSON.stringify(msg, null, 2));
+
+        if (msg.msg_type === 2 && msg.status_code === 0) {
+            const mediaUrl = msg.media_server?.server_urls?.audio || msg.media_server?.server_urls?.all;
+            if (mediaUrl) {
+                connectToMediaWebSocket(mediaUrl, meetingUuid, streamId, ws);
+            }
+        }
+
+        if (msg.msg_type === 12) {
+            const keepAliveResponse = {
+                msg_type: 13,
+                timestamp: msg.timestamp,
+            };
+            ws.send(JSON.stringify(keepAliveResponse));
+        }
+    });
+
+    ws.on('error', (err) => {
+        console.error('❌ Signaling socket error:', err);
+    });
+
+    ws.on('close', () => {
+        console.log('🔌 Signaling socket closed');
+        if (activeConnections.has(meetingUuid)) {
+            delete activeConnections.get(meetingUuid).signaling;
+        }
+    });
+}
+
+function connectToMediaWebSocket(mediaUrl, meetingUuid, streamId, signalingSocket) {
+    console.log(`🎵 Connecting to media WebSocket at ${mediaUrl}`);
+
+    const mediaWs = new WebSocket(mediaUrl, { rejectUnauthorized: false });
+
+    // Store connection for cleanup later
+    if (activeConnections.has(meetingUuid)) {
+        activeConnections.get(meetingUuid).media = mediaWs;
+    }
+
+    mediaWs.on('open', () => {
+        console.log(`✅ Zoom media connected for meeting ${meetingUuid}`);
+        const signature = generateSignature(CLIENT_ID, meetingUuid, streamId, CLIENT_SECRET);
+        
+        const handshake = {
+            msg_type: 3,
+            protocol_version: 1,
+            meeting_uuid: meetingUuid,
+            rtms_stream_id: streamId,
+            signature,
+            media_type: 1, // Request raw audio
+            payload_encryption: false,
+        };
+        mediaWs.send(JSON.stringify(handshake));
+    });
+
+    mediaWs.on('message', (data) => {
+        try {
+            const msg = JSON.parse(data.toString());
+
+            if (msg.msg_type === 4 && msg.status_code === 0) {
+                signalingSocket.send(JSON.stringify({
+                    msg_type: 7,
+                    rtms_stream_id: streamId,
+                }));
+                console.log(`🚀 Started audio streaming for meeting ${meetingUuid}`);
+            }
+
+            if (msg.msg_type === 12) {
+                mediaWs.send(JSON.stringify({
+                    msg_type: 13,
+                    timestamp: msg.timestamp,
+                }));
+            }
+
+            // Handle audio data (msg_type 14 with Base64 data)
+            if (msg.msg_type === 14 && msg.content?.data) {
+                handleAudioData(msg.content.data, meetingUuid);
+            }
+
+        } catch (err) {
+            console.log('📦 Received non-JSON data (should not happen with new format)');
+        }
+    });
+
+    mediaWs.on('error', (err) => {
+        console.error('❌ Media socket error:', err);
+    });
+
+    mediaWs.on('close', () => {
+        console.log('🔌 Media socket closed');
+        if (activeConnections.has(meetingUuid)) {
+            delete activeConnections.get(meetingUuid).media;
+        }
+    });
+}
+
+function handleAudioData(base64Data, meetingUuid) {
+    const collector = audioCollectors.get(meetingUuid);
+    if (!collector || collector.stopRequested) return;
+
+    // Decode base64 to raw audio buffer
+    const audioBuffer = Buffer.from(base64Data, 'base64');
+    
+    // Store for post-meeting processing
+    collector.audioChunks.push(audioBuffer);
+    collector.totalBytes += audioBuffer.length;
+    collector.chunkCount++;
+
+    // Send to AssemblyAI streaming
+    sendToAssemblyAI(audioBuffer, meetingUuid);
+
+    // Log progress every 100 chunks
+    if (collector.chunkCount % 100 === 0) {
+        const duration = (Date.now() - collector.startTime) / 1000;
+        console.log(`🎵 [${meetingUuid.substring(0, 8)}] ${collector.chunkCount} chunks, ${collector.totalBytes} bytes, ${duration.toFixed(1)}s`);
+    }
+}
+
+function sendToAssemblyAI(audioData, meetingUuid) {
+    const collector = audioCollectors.get(meetingUuid);
+    if (!collector || !collector.streamingWs || collector.stopRequested) return;
+
+    // Add to buffer
+    collector.audioBuffer.push(audioData);
+    
+    // Calculate total buffered size
+    const totalBufferedSize = collector.audioBuffer.reduce((sum, chunk) => sum + chunk.length, 0);
+    
+    // Send when we have enough data
+    if (totalBufferedSize >= TARGET_CHUNK_SIZE) {
+        const combinedBuffer = Buffer.concat(collector.audioBuffer);
+        const chunkToSend = combinedBuffer.subarray(0, TARGET_CHUNK_SIZE);
+        const remainingData = combinedBuffer.subarray(TARGET_CHUNK_SIZE);
+        
+        collector.audioBuffer = remainingData.length > 0 ? [remainingData] : [];
+        
+        if (collector.streamingWs.readyState === WebSocket.OPEN) {
+            try {
+                collector.streamingWs.send(chunkToSend);
+            } catch (error) {
+                console.error(`❌ Error sending to AssemblyAI: ${error}`);
+            }
+        }
+    }
+}
+
+function flushAudioBuffer(meetingUuid) {
+    const collector = audioCollectors.get(meetingUuid);
+    if (!collector || collector.audioBuffer.length === 0) return;
+
+    const combinedBuffer = Buffer.concat(collector.audioBuffer);
+    const minChunkSize = (SAMPLE_RATE * CHANNELS * BYTES_PER_SAMPLE * 50) / 1000; // 50ms minimum
+    
+    if (combinedBuffer.length >= minChunkSize && collector.streamingWs?.readyState === WebSocket.OPEN) {
+        try {
+            collector.streamingWs.send(combinedBuffer);
+            console.log(`🔄 Flushed remaining audio for meeting ${meetingUuid}`);
+        } catch (error) {
+            console.error(`❌ Error flushing audio: ${error}`);
+        }
+    }
+    
+    collector.audioBuffer = [];
+}
+
+async function cleanupMeeting(meetingUuid) {
+    const collector = audioCollectors.get(meetingUuid);
+    if (!collector) return;
+
+    console.log(`🧹 Cleaning up meeting ${meetingUuid}`);
+    
+    // Stop streaming
+    collector.stopRequested = true;
+    
+    // Flush remaining audio
+    flushAudioBuffer(meetingUuid);
+    
+    // Close AssemblyAI connection
+    if (collector.streamingWs) {
+        try {
+            if (collector.streamingWs.readyState === WebSocket.OPEN) {
+                collector.streamingWs.send(JSON.stringify({ type: "Terminate" }));
+            }
+            setTimeout(() => {
+                if (collector.streamingWs) {
+                    collector.streamingWs.close();
+                }
+            }, 1000);
+        } catch (error) {
+            console.error(`❌ Error closing AssemblyAI: ${error}`);
+        }
+    }
+
+    // Close Zoom connections
+    if (activeConnections.has(meetingUuid)) {
+        const connections = activeConnections.get(meetingUuid);
+        for (const conn of Object.values(connections)) {
+            if (conn && typeof conn.close === 'function') {
+                conn.close();
+            }
+        }
+        activeConnections.delete(meetingUuid);
+    }
+
+    // Optional: Save audio file for backup/analysis
+    if (collector.audioChunks.length > 0) {
+        await processRecordedAudio(meetingUuid, collector.audioChunks);
+    }
+
+    // Cleanup collector
+    audioCollectors.delete(meetingUuid);
+}
+
+// AI Analysis Functions
 function getSystemPrompt(callContext) {
   return `You are an expert financial consultation analyst monitoring an ongoing financial advisory conversation in real-time. 
     Your role is to provide valuable insights to the financial advisor by analyzing the consultation as it unfolds. 
@@ -424,257 +1534,65 @@ async function processTranscript(transcript) {
   }
 }
 
-function initializeStreamingTranscription() {
-  if (streamingWs) {
-    streamingWs.close();
+async function processRecordedAudio(meetingId, audioChunks) {
+  if (audioChunks.length === 0) {
+    console.log("❌ No audio data received");
+    return;
   }
 
-  audioBuffer = [];
+  const rawFilename = `recording_${meetingId}.raw`;
+  const wavFilename = `recording_${meetingId}.wav`;
 
-  streamingWs = new WebSocket(API_ENDPOINT, {
-    headers: {
-      Authorization: process.env.ASSEMBLYAI_API_KEY,
-    },
-  });
-
-  streamingWs.on("open", () => {
-    console.log("🎙️  Streaming WebSocket connection opened.");
-    console.log(`Connected to: ${API_ENDPOINT}`);
-    console.log(`Target chunk size: ${TARGET_CHUNK_SIZE} bytes (${TARGET_CHUNK_DURATION_MS}ms)`);
-  });
-
-  streamingWs.on("message", async (message) => {
-    try {
-      const data = JSON.parse(message);
-      const msgType = data.type;
-
-      if (msgType === "Begin") {
-        const sessionId = data.id;
-        const expiresAt = data.expires_at;
-        console.log(
-          `✅ Session began: ID=${sessionId}, ExpiresAt=${new Date(expiresAt * 1000).toISOString()}`
-        );
-      } else if (msgType === "Turn") {
-        const transcript = data.transcript || "";
-        const formatted = data.turn_is_formatted;
-
-        if (formatted) {
-          // Clear line and print final transcript
-          process.stdout.write('\r' + ' '.repeat(80) + '\r');
-          console.log("📝 Real-time Final:", transcript);
-          
-          // Process transcript for financial consultation insights
-          await processTranscript(transcript);
-          
-          // Display updated dashboard every few transcripts
-          displayCurrentFinancialData();
-        } else {
-          // Show partial transcript
-          process.stdout.write(`\r📝 Real-time Partial: ${transcript}`);
-        }
-      } else if (msgType === "Termination") {
-        const audioDuration = data.audio_duration_seconds;
-        const sessionDuration = data.session_duration_seconds;
-        console.log(
-          `\n🏁 Session Terminated: Audio Duration=${audioDuration}s, Session Duration=${sessionDuration}s`
-        );
-        
-        // Final consultation summary
-        console.log('\n💼 FINAL FINANCIAL CONSULTATION SUMMARY:');
-        displayCurrentFinancialData();
-      }
-    } catch (error) {
-      console.error(`❌ Error handling streaming message: ${error}`);
-    }
-  });
-
-  streamingWs.on("error", (error) => {
-    console.error(`❌ Streaming WebSocket Error: ${error}`);
-    stopRequested = true;
-  });
-
-  streamingWs.on("close", (code, reason) => {
-    console.log(`🔌 Streaming WebSocket Disconnected: Status=${code}, Msg=${reason}`);
-  });
-}
-
-function sendBufferedAudio(data) {
-  audioBuffer.push(data);
-  
-  const totalBufferedSize = audioBuffer.reduce((sum, chunk) => sum + chunk.length, 0);
-  
-  if (totalBufferedSize >= TARGET_CHUNK_SIZE) {
-    const combinedBuffer = Buffer.concat(audioBuffer);
-    const chunkToSend = combinedBuffer.subarray(0, TARGET_CHUNK_SIZE);
-    const remainingData = combinedBuffer.subarray(TARGET_CHUNK_SIZE);
-    audioBuffer = remainingData.length > 0 ? [remainingData] : [];
-    
-    if (streamingWs && streamingWs.readyState === WebSocket.OPEN && !stopRequested) {
-      try {
-        streamingWs.send(chunkToSend);
-      } catch (error) {
-        console.error("❌ Error sending audio to streaming transcription:", error);
-      }
-    }
-  }
-}
-
-function flushAudioBuffer() {
-  if (audioBuffer.length > 0) {
-    const combinedBuffer = Buffer.concat(audioBuffer);
-    const minChunkSize = (SAMPLE_RATE * CHANNELS * BYTES_PER_SAMPLE * 50) / 1000;
-    
-    if (combinedBuffer.length >= minChunkSize && streamingWs && streamingWs.readyState === WebSocket.OPEN) {
-      try {
-        streamingWs.send(combinedBuffer);
-        console.log(`🔄 Flushed remaining ${combinedBuffer.length} bytes to streaming API`);
-      } catch (error) {
-        console.error("❌ Error flushing audio buffer:", error);
-      }
-    }
-    
-    audioBuffer = [];
-  }
-}
-
-function cleanupStreamingTranscription() {
-  stopRequested = true;
-  flushAudioBuffer();
-  
-  if (streamingWs && [WebSocket.OPEN, WebSocket.CONNECTING].includes(streamingWs.readyState)) {
-    try {
-      if (streamingWs.readyState === WebSocket.OPEN) {
-        const terminateMessage = { type: "Terminate" };
-        console.log(`📤 Sending termination message: ${JSON.stringify(terminateMessage)}`);
-        streamingWs.send(JSON.stringify(terminateMessage));
-      }
-      
-      setTimeout(() => {
-        if (streamingWs) {
-          streamingWs.close();
-          streamingWs = null;
-        }
-      }, 1000);
-    } catch (error) {
-      console.error(`❌ Error closing streaming WebSocket: ${error}`);
-    }
-  }
-  
-  audioBuffer = [];
-}
-
-rtms.onWebhookEvent(({ event, payload }) => {
-  console.log('📡', event, payload);
-
-  if (event === "meeting.rtms_started") {
-    // Initialize consultation
-    conversationId = payload.meeting_uuid.replace(/[^a-zA-Z0-9]/g, "_");
-    conversationHistory = [];
-    financialData = {
-      summary: [],
-      faint: {
-        funds: "Not identified",
-        authority: "Not identified", 
-        interest: "Not identified",
-        need: "Not identified",
-        timing: "Not identified"
-      },
-      clientInfo: "Not identified",
-      advisorReminders: [],
-      concerns: [],
-      strategicQuestions: []
-    };
-    
-    console.log('\n💼 STARTING FINANCIAL CONSULTATION ANALYSIS');
-    console.log(`📞 Meeting ID: ${conversationId}`);
-    console.log('🤖 AI Financial Assistant is now monitoring the consultation...\n');
-    
-    initializeStreamingTranscription();
-    
-    rtmsClient = new rtms.Client();
-
-    rtmsClient.onAudioData((data, timestamp, metadata) => {
-      audioChunks.push(data);
-      sendBufferedAudio(data);
-    });
-
-    rtmsClient.join(payload);
-  } else if (event === "meeting.rtms_stopped") {
-    cleanupStreamingTranscription();
-    
-    console.log('\n🏁 CONSULTATION ENDED - GENERATING FINAL REPORT');
-    displayCurrentFinancialData();
-    
-    if (audioChunks.length === 0) {
-      console.error("❌ No audio data received");
-      process.exit(1);
-    }
-
-    const meetingId = payload.meeting_uuid.replace(/[^a-zA-Z0-9]/g, "_");
-    const rawFilename = `recording_${meetingId}.raw`;
-    const wavFilename = `recording_${meetingId}.wav`;
-
+  try {
     const combinedBuffer = Buffer.concat(audioChunks);
     fs.writeFileSync(rawFilename, combinedBuffer);
 
-    convertRawToWav(rawFilename, wavFilename)
-      .then(async () => {
-        console.log("🎵 WAV saved: ", wavFilename);
+    await convertRawToWav(rawFilename, wavFilename);
+    console.log("🎵 WAV saved: ", wavFilename);
 
-        try {
-          console.log("📄 Starting post-consultation transcription for backup...");
-          
-          const { AssemblyAI } = await import("assemblyai");
-          const client = new AssemblyAI({
-            apiKey: process.env.ASSEMBLYAI_API_KEY,
-          });
-          
-          const transcript = await client.transcripts.transcribe({
-            audio: wavFilename,
-          });
+    console.log("📄 Starting post-consultation transcription for backup...");
+    
+    const client = new AssemblyAI({
+      apiKey: process.env.ASSEMBLYAI_API_KEY,
+    });
+    
+    const transcript = await client.transcripts.transcribe({
+      audio: wavFilename,
+    });
 
-          if (transcript.status === "error") {
-            console.error(`❌ Post-consultation transcription failed: ${transcript.error}`);
-          } else {
-            console.log("✅ Post-consultation transcription completed");
-            
-            // Save final report
-            const finalReport = {
-              meetingId,
-              timestamp: new Date().toISOString(),
-              financialData,
-              conversationHistory,
-              fullTranscript: transcript.text
-            };
-            
-            fs.writeFileSync(
-              `./consultation_logs/${meetingId}_final_report.json`, 
-              JSON.stringify(finalReport, null, 2)
-            );
-            
-            console.log(`📊 Final consultation report saved: ./consultation_logs/${meetingId}_final_report.json`);
-          }
-        } catch (error) {
-          console.error("❌ Post-consultation transcription error:", error);
-        } finally {
-          audioChunks = [];
-          if (rtmsClient) {
-            rtmsClient.leave();
-            rtmsClient = null;
-          }
-          fs.unlinkSync(wavFilename);
-        }
-      })
-      .catch((error) => {
-        console.error("❌ Error converting audio:", error);
-        audioChunks = [];
-        if (rtmsClient) {
-          rtmsClient.leave();
-          rtmsClient = null;
-        }
-      });
+    if (transcript.status === "error") {
+      console.error(`❌ Post-consultation transcription failed: ${transcript.error}`);
+    } else {
+      console.log("✅ Post-consultation transcription completed");
+      
+      // Save final report
+      const finalReport = {
+        meetingId,
+        timestamp: new Date().toISOString(),
+        financialData,
+        conversationHistory,
+        fullTranscript: transcript.text
+      };
+      
+      fs.writeFileSync(
+        `./consultation_logs/${meetingId}_final_report.json`, 
+        JSON.stringify(finalReport, null, 2)
+      );
+      
+      console.log(`📊 Final consultation report saved: ./consultation_logs/${meetingId}_final_report.json`);
+    }
+  } catch (error) {
+    console.error("❌ Post-consultation transcription error:", error);
+  } finally {
+    // Cleanup
+    try {
+      if (fs.existsSync(rawFilename)) fs.unlinkSync(rawFilename);
+      if (fs.existsSync(wavFilename)) fs.unlinkSync(wavFilename);
+    } catch (e) {
+      console.error("❌ Error cleaning up audio files:", e);
+    }
   }
-});
+}
 
 async function convertRawToWav(rawFilename, wavFilename) {
   const command = `ffmpeg -y -f s16le -ar 16000 -ac 1 -i ${rawFilename} ${wavFilename}`;
@@ -682,34 +1600,40 @@ async function convertRawToWav(rawFilename, wavFilename) {
   fs.unlinkSync(rawFilename);
 }
 
+// Start the server
+const server = app.listen(PORT, () => {
+  console.log(`🌐 Financial Consultation Intelligence System running at http://localhost:${PORT}`);
+  console.log(`🔗 Webhook endpoint at http://localhost:${PORT}/webhook`);
+  console.log('💡 Make sure your environment variables are set in .env\n');
+});
+
 // Handle graceful shutdown
 process.on("SIGINT", () => {
   console.log("\n🛑 Ctrl+C received. Stopping...");
-  cleanupStreamingTranscription();
-  if (rtmsClient) {
-    rtmsClient.leave();
+  
+  // Clean up all active meetings
+  for (const [meetingId] of audioCollectors.entries()) {
+    cleanupMeeting(meetingId);
   }
-  setTimeout(() => process.exit(0), 1000);
+  
+  setTimeout(() => process.exit(0), 2000);
 });
 
 process.on("SIGTERM", () => {
   console.log("\n🛑 Termination signal received. Stopping...");
-  cleanupStreamingTranscription();
-  if (rtmsClient) {
-    rtmsClient.leave();
+  
+  // Clean up all active meetings
+  for (const [meetingId] of audioCollectors.entries()) {
+    cleanupMeeting(meetingId);
   }
-  setTimeout(() => process.exit(0), 1000);
+  
+  setTimeout(() => process.exit(0), 2000);
 });
 
 process.on("uncaughtException", (error) => {
   console.error(`\n❌ Uncaught exception: ${error}`);
-  cleanupStreamingTranscription();
-  if (rtmsClient) {
-    rtmsClient.leave();
-  }
   setTimeout(() => process.exit(1), 1000);
 });
 
 console.log('\n💼 ZOOM FINANCIAL CONSULTATION INTELLIGENCE SYSTEM STARTED');
 console.log('🤖 Ready to analyze financial consultations...');
-console.log('💡 Make sure your ASSEMBLYAI_API_KEY and ANTHROPIC_API_KEY are set in .env\n');
