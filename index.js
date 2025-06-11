@@ -57,6 +57,12 @@ let financialData = {
 // Global transcript storage
 global.liveTranscripts = [];
 
+// Speaker management
+const speakerMapping = new Map(); // Maps user_id to role (Consultant/Client)
+const detectedSpeakers = new Set(); // Track all detected user_ids
+let currentSpeakerId = null;
+let lastTranscriptSpeaker = null;
+
 // Audio streaming configuration
 const SAMPLE_RATE = 16000;
 const CHANNELS = 1;
@@ -80,12 +86,13 @@ const API_ENDPOINT = `${API_ENDPOINT_BASE_URL}?${querystring.stringify(CONNECTIO
 const app = express();
 const PORT = 8080;
 
-// Security middleware with helmet
+// FIXED: Security middleware with helmet - allowing inline event handlers
 app.use(helmet({
   contentSecurityPolicy: {
     directives: {
       defaultSrc: ["'self'"],
       scriptSrc: ["'self'", "'unsafe-inline'"],
+      scriptSrcAttr: ["'unsafe-inline'"], // This allows inline event handlers
       styleSrc: ["'self'", "'unsafe-inline'"],
       imgSrc: ["'self'", "data:", "https:"],
       connectSrc: ["'self'"],
@@ -360,6 +367,71 @@ app.get('/', (req, res) => {
                 background: #f8f9fa;
             }
             
+            .speaker-controls {
+                background: white;
+                border-radius: 12px;
+                padding: 20px;
+                margin-bottom: 20px;
+                box-shadow: 0 2px 12px rgba(0, 0, 0, 0.08);
+                border: 1px solid #e9ecef;
+            }
+            
+            .speaker-controls h3 {
+                margin-bottom: 15px;
+                color: #2c3e50;
+                font-size: 1.1em;
+            }
+            
+            .speaker-list {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+                gap: 15px;
+            }
+            
+            .speaker-item {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                gap: 10px;
+                padding: 15px;
+                background: #f8f9fa;
+                border-radius: 8px;
+                border: 1px solid #e9ecef;
+                transition: all 0.2s ease;
+            }
+            
+            .speaker-item.active {
+                border-color: #28a745;
+                background: #d4edda;
+                box-shadow: 0 2px 8px rgba(40, 167, 69, 0.2);
+            }
+            
+            .speaker-info {
+                display: flex;
+                flex-direction: column;
+                gap: 5px;
+            }
+            
+            .speaker-id {
+                font-weight: bold;
+                color: #2c3e50;
+            }
+            
+            .speaker-status {
+                font-size: 0.85em;
+                color: #28a745;
+                font-weight: 500;
+            }
+            
+            .speaker-select {
+                padding: 8px 12px;
+                border: 1px solid #ddd;
+                border-radius: 6px;
+                background: white;
+                font-size: 0.9em;
+                min-width: 120px;
+            }
+            
             .dashboard-section {
                 background: white;
                 border-radius: 12px;
@@ -463,12 +535,22 @@ app.get('/', (req, res) => {
                 transition: all 0.2s ease;
                 line-height: 1.6;
             }
-
+            
             .transcript-entry:hover {
                 background: rgba(79, 209, 199, 0.15);
                 transform: translateX(4px);
             }
-
+            
+            .transcript-entry.consultant {
+                border-left-color: #fbbf24;
+                background: rgba(251, 191, 36, 0.1);
+            }
+            
+            .transcript-entry.client {
+                border-left-color: #60a5fa;
+                background: rgba(96, 165, 250, 0.1);
+            }
+            
             .transcript-timestamp {
                 color: #4fd1c7;
                 font-size: 0.85em;
@@ -476,12 +558,25 @@ app.get('/', (req, res) => {
                 font-weight: 600;
                 font-family: 'SF Mono', 'Monaco', 'Inconsolata', 'Roboto Mono', monospace;
             }
-
+            
             .transcript-text {
                 color: #e2e8f0;
                 line-height: 1.6;
                 white-space: pre-wrap;
                 word-wrap: break-word;
+            }
+            
+            .speaker-label {
+                font-weight: bold;
+                margin-right: 8px;
+            }
+            
+            .speaker-label.consultant {
+                color: #fbbf24;
+            }
+            
+            .speaker-label.client {
+                color: #60a5fa;
             }
             
             .status-active {
@@ -524,6 +619,16 @@ app.get('/', (req, res) => {
                 0% { opacity: 1; }
                 50% { opacity: 0.5; }
                 100% { opacity: 1; }
+            }
+            
+            .debug-info {
+                background: #f1f3f4;
+                border: 1px solid #dadce0;
+                border-radius: 8px;
+                padding: 10px;
+                margin-top: 10px;
+                font-size: 0.8em;
+                color: #5f6368;
             }
             
             /* Custom scrollbar */
@@ -575,6 +680,10 @@ app.get('/', (req, res) => {
                 .header h1 {
                     font-size: 1.4em;
                 }
+                
+                .speaker-list {
+                    grid-template-columns: 1fr;
+                }
             }
         </style>
     </head>
@@ -614,6 +723,16 @@ app.get('/', (req, res) => {
 
             <div id="dashboard-tab" class="tab-content active">
                 <div class="dashboard-container">
+                    <div id="speaker-controls" class="speaker-controls" style="display: none;">
+                        <h3>👥 Speaker Assignment</h3>
+                        <div id="speaker-list" class="speaker-list">
+                            <!-- Speakers will be populated here -->
+                        </div>
+                        <div id="debug-info" class="debug-info" style="display: none;">
+                            <!-- Debug information will appear here -->
+                        </div>
+                    </div>
+                    
                     <div id="financial-dashboard">
                         <div class="empty-state">
                             <div class="pulse">💤</div>
@@ -636,211 +755,307 @@ app.get('/', (req, res) => {
         </div>
 
         <script>
-          let transcriptData = [];
-          let isActiveCall = false;
+            let transcriptData = [];
+            let isActiveCall = false;
+            let debugMode = false;
 
-          function showTab(tabName) {
-              // Hide all tabs
-              document.querySelectorAll('.tab-content').forEach(tab => {
-                  tab.classList.remove('active');
-              });
-              document.querySelectorAll('.tab').forEach(tab => {
-                  tab.classList.remove('active');
-              });
+            // Enable debug mode by adding ?debug=1 to URL
+            if (window.location.search.includes('debug=1')) {
+                debugMode = true;
+                console.log('🐛 Debug mode enabled');
+            }
 
-              // Show selected tab
-              document.getElementById(tabName + '-tab').classList.add('active');
-              
-              // Find and activate the clicked tab
-              if (tabName === 'dashboard') {
-                  document.querySelector('.tab:first-child').classList.add('active');
-              } else if (tabName === 'transcript') {
-                  document.querySelector('.tab:last-child').classList.add('active');
-              }
-          }
+            function showTab(tabName) {
+                // Hide all tabs
+                document.querySelectorAll('.tab-content').forEach(tab => {
+                    tab.classList.remove('active');
+                });
+                document.querySelectorAll('.tab').forEach(tab => {
+                    tab.classList.remove('active');
+                });
 
-          async function updateDashboard() {
-              try {
-                  // Get system status
-                  const statusResponse = await fetch('/api/status');
-                  const statusData = await statusResponse.json();
-                  
-                  // Update status bar
-                  document.getElementById('system-status').innerHTML = 
-                      statusData.status === 'active' ? 
-                      '<span class="status-active">🟢 ACTIVE</span>' : 
-                      '<span class="status-inactive">🔴 STANDBY</span>';
-                  
-                  document.getElementById('meeting-count').textContent = statusData.active_meetings;
-                  document.getElementById('ai-status').innerHTML = 
-                      statusData.features.ai_analysis ? 
-                      '<span class="status-active">✅ ONLINE</span>' : 
-                      '<span class="status-inactive">❌ OFFLINE</span>';
-                  
-                  document.getElementById('last-update').textContent = 
-                      new Date().toLocaleTimeString();
+                // Show selected tab
+                document.getElementById(tabName + '-tab').classList.add('active');
+                
+                // Find and activate the clicked tab
+                document.querySelector(\`[data-tab="\${tabName}"]\`).classList.add('active');
+            }
 
-                  isActiveCall = statusData.status === 'active';
+            async function updateSpeakers() {
+                try {
+                    const response = await fetch('/api/speakers');
+                    const data = await response.json();
+                    
+                    if (debugMode) {
+                        console.log('🐛 Speakers data:', data);
+                        document.getElementById('debug-info').style.display = 'block';
+                        document.getElementById('debug-info').innerHTML = \`
+                            <strong>Debug Info:</strong><br>
+                            Detected Speakers: \${JSON.stringify(data.speakers)}<br>
+                            Current Speaker: \${data.currentSpeaker}<br>
+                            <a href="/api/debug/speakers" target="_blank">View Full Debug</a>
+                        \`;
+                    }
+                    
+                    if (data.speakers && data.speakers.length > 0) {
+                        document.getElementById('speaker-controls').style.display = 'block';
+                        updateSpeakerControls(data.speakers);
+                    } else {
+                        document.getElementById('speaker-controls').style.display = 'none';
+                    }
+                } catch (error) {
+                    console.error('Error updating speakers:', error);
+                }
+            }
 
-                  // Get financial data if call is active
-                  if (isActiveCall) {
-                      const dashResponse = await fetch('/api/dashboard');
-                      const dashData = await dashResponse.json();
-                      updateFinancialDashboard(dashData.financial_data);
-                      
-                      // Get transcript data
-                      const transcriptResponse = await fetch('/api/transcript');
-                      const transcriptDataResponse = await transcriptResponse.json();
-                      updateTranscript(transcriptDataResponse.transcripts || []);
-                  } else {
-                      // Show waiting state
-                      document.getElementById('financial-dashboard').innerHTML = \`
-                          <div class="empty-state">
-                              <div class="pulse">💤</div>
-                              <h3>Waiting for consultation to begin...</h3>
-                              <p>Start a Zoom meeting with RTMS enabled to see live financial intelligence.</p>
-                          </div>
-                      \`;
-                      
-                      document.getElementById('transcript-container').innerHTML = \`
-                          <div class="empty-state-transcript">
-                              <div class="pulse">🎙️</div>
-                              <h3>Waiting for live transcription...</h3>
-                              <p>Transcript will appear here when the consultation begins.</p>
-                          </div>
-                      \`;
-                  }
-                  
-              } catch (error) {
-                  console.error('Error updating dashboard:', error);
-              }
-          }
+            function updateSpeakerControls(speakers) {
+                const speakerList = document.getElementById('speaker-list');
+                
+                speakerList.innerHTML = speakers.map(speaker => \`
+                    <div class="speaker-item \${speaker.isActive ? 'active' : ''}">
+                        <div class="speaker-info">
+                            <div class="speaker-id">Speaker \${speaker.id}</div>
+                            \${speaker.isActive ? '<div class="speaker-status">🎙️ Currently Speaking</div>' : ''}
+                        </div>
+                        <select class="speaker-select" data-speaker-id="\${speaker.id}">
+                            <option value="Unassigned" \${speaker.role === 'Unassigned' ? 'selected' : ''}>Unassigned</option>
+                            <option value="Consultant" \${speaker.role === 'Consultant' ? 'selected' : ''}>🏢 Consultant</option>
+                            <option value="Client" \${speaker.role === 'Client' ? 'selected' : ''}>👤 Client</option>
+                        </select>
+                    </div>
+                \`).join('');
 
-          function updateFinancialDashboard(data) {
-              const dashboard = document.getElementById('financial-dashboard');
-              
-              dashboard.innerHTML = \`
-                  <div class="dashboard-section">
-                      <div class="section-title">📝 Consultation Summary</div>
-                      \${data.summary && data.summary.length > 0 ? 
-                          data.summary.map((point, i) => \`<div class="list-item">\${i + 1}. \${point}</div>\`).join('') :
-                          '<div style="color: #6c757d; font-style: italic; padding: 20px; text-align: center;">No key points identified yet</div>'
-                      }
-                  </div>
+                // Add event listeners to selects (replacing inline handlers)
+                document.querySelectorAll('.speaker-select').forEach(select => {
+                    select.addEventListener('change', function() {
+                        const speakerId = this.getAttribute('data-speaker-id');
+                        const role = this.value;
+                        assignSpeaker(speakerId, role);
+                    });
+                });
+            }
 
-                  <div class="dashboard-section">
-                      <div class="section-title">💎 FAINT Qualification</div>
-                      <div class="faint-grid">
-                          <div class="faint-label">💰 Funds:</div>
-                          <div class="faint-value">\${data.faint?.funds || 'Not identified'}</div>
-                          
-                          <div class="faint-label">👤 Authority:</div>
-                          <div class="faint-value">\${data.faint?.authority || 'Not identified'}</div>
-                          
-                          <div class="faint-label">🎯 Interest:</div>
-                          <div class="faint-value">\${data.faint?.interest || 'Not identified'}</div>
-                          
-                          <div class="faint-label">🎪 Need:</div>
-                          <div class="faint-value">\${data.faint?.need || 'Not identified'}</div>
-                          
-                          <div class="faint-label">⏰ Timing:</div>
-                          <div class="faint-value">\${data.faint?.timing || 'Not identified'}</div>
-                      </div>
-                  </div>
+            async function assignSpeaker(speakerId, role) {
+                console.log(\`🔄 Attempting to assign Speaker \${speakerId} as \${role}\`);
+                
+                try {
+                    const response = await fetch('/api/speakers/assign', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                        },
+                        body: JSON.stringify({ speakerId: parseInt(speakerId), role })
+                    });
+                    
+                    const result = await response.json();
+                    console.log('✅ Assignment response:', result);
+                    
+                    if (response.ok) {
+                        console.log(\`✅ Speaker \${speakerId} assigned as \${role}\`);
+                        
+                        // Force immediate refresh
+                        await updateSpeakers();
+                        
+                        // Also refresh transcript to show new labels
+                        setTimeout(async () => {
+                            await updateDashboard();
+                        }, 100);
+                    } else {
+                        console.error('❌ Assignment failed:', result);
+                    }
+                } catch (error) {
+                    console.error('❌ Error assigning speaker:', error);
+                }
+            }
 
-                  <div class="dashboard-section">
-                      <div class="section-title">👤 Client Information</div>
-                      <div class="list-item">\${data.clientInfo || 'Not identified'}</div>
-                  </div>
+            async function updateDashboard() {
+                try {
+                    // Get system status
+                    const statusResponse = await fetch('/api/status');
+                    const statusData = await statusResponse.json();
+                    
+                    // Update status bar
+                    document.getElementById('system-status').innerHTML = 
+                        statusData.status === 'active' ? 
+                        '<span class="status-active">🟢 ACTIVE</span>' : 
+                        '<span class="status-inactive">🔴 STANDBY</span>';
+                    
+                    document.getElementById('meeting-count').textContent = statusData.active_meetings;
+                    document.getElementById('ai-status').innerHTML = 
+                        statusData.features.ai_analysis ? 
+                        '<span class="status-active">✅ ONLINE</span>' : 
+                        '<span class="status-inactive">❌ OFFLINE</span>';
+                    
+                    document.getElementById('last-update').textContent = 
+                        new Date().toLocaleTimeString();
 
-                  <div class="dashboard-section">
-                      <div class="section-title">💡 Advisor Reminders</div>
-                      \${data.advisorReminders && data.advisorReminders.length > 0 ? 
-                          data.advisorReminders.map((reminder, i) => \`<div class="list-item">\${i + 1}. \${reminder}</div>\`).join('') :
-                          '<div style="color: #6c757d; font-style: italic; padding: 20px; text-align: center;">No reminders yet</div>'
-                      }
-                  </div>
+                    isActiveCall = statusData.status === 'active';
 
-                  <div class="dashboard-section">
-                      <div class="section-title">⚠️ Client Concerns & Addressing</div>
-                      \${data.concerns && data.concerns.length > 0 ? 
-                          data.concerns.map((concern, i) => \`
-                              <div class="concern-item">
-                                  <strong>Concern:</strong> \${concern.concern}<br><br>
-                                  <strong>Strategy:</strong> \${concern.addressing_strategy}
-                              </div>
-                          \`).join('') :
-                          '<div style="color: #6c757d; font-style: italic; padding: 20px; text-align: center;">No concerns identified yet</div>'
-                      }
-                  </div>
+                    // Update speakers
+                    await updateSpeakers();
 
-                  <div class="dashboard-section">
-                      <div class="section-title">❓ Strategic Questions to Ask</div>
-                      \${data.strategicQuestions && data.strategicQuestions.length > 0 ? 
-                          data.strategicQuestions.map((question, i) => \`
-                              <div class="question-item">
-                                  <strong>\${i + 1}. Question:</strong> "\${question.question}"<br><br>
-                                  <strong>Purpose:</strong> \${question.purpose}
-                              </div>
-                          \`).join('') :
-                          '<div style="color: #6c757d; font-style: italic; padding: 20px; text-align: center;">No strategic questions suggested yet</div>'
-                      }
-                  </div>
-              \`;
-          }
+                    // Get financial data if call is active
+                    if (isActiveCall) {
+                        const dashResponse = await fetch('/api/dashboard');
+                        const dashData = await dashResponse.json();
+                        updateFinancialDashboard(dashData.financial_data);
+                        
+                        // Get transcript data
+                        const transcriptResponse = await fetch('/api/transcript');
+                        const transcriptDataResponse = await transcriptResponse.json();
+                        updateTranscript(transcriptDataResponse.transcripts || []);
+                    } else {
+                        // Show waiting state
+                        document.getElementById('financial-dashboard').innerHTML = \`
+                            <div class="empty-state">
+                                <div class="pulse">💤</div>
+                                <h3>Waiting for consultation to begin...</h3>
+                                <p>Start a Zoom meeting with RTMS enabled to see live financial intelligence.</p>
+                            </div>
+                        \`;
+                        
+                        document.getElementById('transcript-container').innerHTML = \`
+                            <div class="empty-state-transcript">
+                                <div class="pulse">🎙️</div>
+                                <h3>Waiting for live transcription...</h3>
+                                <p>Transcript will appear here when the consultation begins.</p>
+                            </div>
+                        \`;
+                    }
+                    
+                } catch (error) {
+                    console.error('Error updating dashboard:', error);
+                }
+            }
 
-          function updateTranscript(transcripts) {
-              const container = document.getElementById('transcript-container');
-              
-              if (!transcripts || transcripts.length === 0) {
-                  container.innerHTML = \`
-                      <div class="empty-state-transcript">
-                          <div class="pulse">🎙️</div>
-                          <h3>No transcript data available yet...</h3>
-                          <p>Transcription will appear here once the conversation begins.</p>
-                      </div>
-                  \`;
-                  return;
-              }
-              
-              // Group transcripts and format with line breaks
-              const transcriptText = transcripts.map(entry => \`
-                  <div class="transcript-entry">
-                      <div class="transcript-timestamp">[\${entry.timestamp}]</div>
-                      <div class="transcript-text">\${entry.text}</div>
-                  </div>
-              \`).join('');
-              
-              container.innerHTML = transcriptText;
-              
-              // Auto-scroll to bottom
-              container.scrollTop = container.scrollHeight;
-          }
+            function updateFinancialDashboard(data) {
+                const dashboard = document.getElementById('financial-dashboard');
+                
+                dashboard.innerHTML = \`
+                    <div class="dashboard-section">
+                        <div class="section-title">📝 Consultation Summary</div>
+                        \${data.summary && data.summary.length > 0 ? 
+                            data.summary.map((point, i) => \`<div class="list-item">\${i + 1}. \${point}</div>\`).join('') :
+                            '<div style="color: #6c757d; font-style: italic; padding: 20px; text-align: center;">No key points identified yet</div>'
+                        }
+                    </div>
 
-          // Initial load
-          updateDashboard();
-          
-          // Auto-refresh every 2 seconds during active calls, 10 seconds during standby
-          function scheduleUpdate() {
-              const interval = isActiveCall ? 2000 : 10000;
-              setTimeout(() => {
-                  updateDashboard().then(scheduleUpdate);
-              }, interval);
-          }
-          scheduleUpdate();
+                    <div class="dashboard-section">
+                        <div class="section-title">💎 FAINT Qualification</div>
+                        <div class="faint-grid">
+                            <div class="faint-label">💰 Funds:</div>
+                            <div class="faint-value">\${data.faint?.funds || 'Not identified'}</div>
+                            
+                            <div class="faint-label">👤 Authority:</div>
+                            <div class="faint-value">\${data.faint?.authority || 'Not identified'}</div>
+                            
+                            <div class="faint-label">🎯 Interest:</div>
+                            <div class="faint-value">\${data.faint?.interest || 'Not identified'}</div>
+                            
+                            <div class="faint-label">🎪 Need:</div>
+                            <div class="faint-value">\${data.faint?.need || 'Not identified'}</div>
+                            
+                            <div class="faint-label">⏰ Timing:</div>
+                            <div class="faint-value">\${data.faint?.timing || 'Not identified'}</div>
+                        </div>
+                    </div>
 
-          // Add click event listeners after page loads
-          document.addEventListener('DOMContentLoaded', function() {
-              // Add click handlers to tabs
-              document.querySelector('.tab:first-child').addEventListener('click', function() {
-                  showTab('dashboard');
-              });
-              
-              document.querySelector('.tab:last-child').addEventListener('click', function() {
-                  showTab('transcript');
-              });
-          });
-      </script>
+                    <div class="dashboard-section">
+                        <div class="section-title">👤 Client Information</div>
+                        <div class="list-item">\${data.clientInfo || 'Not identified'}</div>
+                    </div>
+
+                    <div class="dashboard-section">
+                        <div class="section-title">💡 Advisor Reminders</div>
+                        \${data.advisorReminders && data.advisorReminders.length > 0 ? 
+                            data.advisorReminders.map((reminder, i) => \`<div class="list-item">\${i + 1}. \${reminder}</div>\`).join('') :
+                            '<div style="color: #6c757d; font-style: italic; padding: 20px; text-align: center;">No reminders yet</div>'
+                        }
+                    </div>
+
+                    <div class="dashboard-section">
+                        <div class="section-title">⚠️ Client Concerns & Addressing</div>
+                        \${data.concerns && data.concerns.length > 0 ? 
+                            data.concerns.map((concern, i) => \`
+                                <div class="concern-item">
+                                    <strong>Concern:</strong> \${concern.concern}<br><br>
+                                    <strong>Strategy:</strong> \${concern.addressing_strategy}
+                                </div>
+                            \`).join('') :
+                            '<div style="color: #6c757d; font-style: italic; padding: 20px; text-align: center;">No concerns identified yet</div>'
+                        }
+                    </div>
+
+                    <div class="dashboard-section">
+                        <div class="section-title">❓ Strategic Questions to Ask</div>
+                        \${data.strategicQuestions && data.strategicQuestions.length > 0 ? 
+                            data.strategicQuestions.map((question, i) => \`
+                                <div class="question-item">
+                                    <strong>\${i + 1}. Question:</strong> "\${question.question}"<br><br>
+                                    <strong>Purpose:</strong> \${question.purpose}
+                                </div>
+                            \`).join('') :
+                            '<div style="color: #6c757d; font-style: italic; padding: 20px; text-align: center;">No strategic questions suggested yet</div>'
+                        }
+                    </div>
+                \`;
+            }
+
+            function updateTranscript(transcripts) {
+                const container = document.getElementById('transcript-container');
+                
+                if (!transcripts || transcripts.length === 0) {
+                    container.innerHTML = \`
+                        <div class="empty-state-transcript">
+                            <div class="pulse">🎙️</div>
+                            <h3>No transcript data available yet...</h3>
+                            <p>Transcription will appear here once the conversation begins.</p>
+                        </div>
+                    \`;
+                    return;
+                }
+                
+                // Group transcripts and format with speaker labels
+                const transcriptText = transcripts.map(entry => {
+                    const speakerClass = entry.speaker ? entry.speaker.toLowerCase() : '';
+                    const speakerIcon = entry.speaker === 'Consultant' ? '🏢' : entry.speaker === 'Client' ? '👤' : '🎙️';
+                    
+                    return \`
+                        <div class="transcript-entry \${speakerClass}">
+                            <div class="transcript-timestamp">[\${entry.timestamp}] \${speakerIcon} \${entry.speaker || 'Unknown'}</div>
+                            <div class="transcript-text">\${entry.text.replace(/^(Consultant|Client): /, '')}</div>
+                        </div>
+                    \`;
+                }).join('');
+                
+                container.innerHTML = transcriptText;
+                
+                // Auto-scroll to bottom
+                container.scrollTop = container.scrollHeight;
+            }
+
+            // Initial load
+            updateDashboard();
+            
+            // Auto-refresh every 2 seconds during active calls, 5 seconds during standby
+            function scheduleUpdate() {
+                const interval = isActiveCall ? 2000 : 5000;
+                setTimeout(() => {
+                    updateDashboard().then(scheduleUpdate);
+                }, interval);
+            }
+            scheduleUpdate();
+
+            // Add click event listeners for tabs
+            document.addEventListener('DOMContentLoaded', function() {
+                document.querySelectorAll('.tab').forEach(tab => {
+                    tab.addEventListener('click', function() {
+                        const tabName = this.getAttribute('data-tab');
+                        showTab(tabName);
+                    });
+                });
+            });
+        </script>
     </body>
     </html>
   `);
@@ -853,6 +1068,68 @@ app.get('/api/transcript', (req, res) => {
     conversation_id: conversationId,
     timestamp: new Date().toISOString()
   });
+});
+
+// API endpoint to get detected speakers
+app.get('/api/speakers', (req, res) => {
+    const speakers = Array.from(detectedSpeakers).map(speakerId => ({
+        id: speakerId,
+        role: speakerMapping.get(speakerId) || 'Unassigned',
+        isActive: currentSpeakerId === speakerId
+    }));
+    
+    res.json({
+        speakers,
+        currentSpeaker: currentSpeakerId,
+        timestamp: new Date().toISOString()
+    });
+});
+
+// API endpoint to assign speaker roles (ENHANCED WITH DEBUGGING)
+app.post('/api/speakers/assign', (req, res) => {
+    let { speakerId, role } = req.body;
+    
+    // Ensure speakerId is a number
+    speakerId = parseInt(speakerId);
+    
+    console.log(`📝 Assigning Speaker ${speakerId} (type: ${typeof speakerId}) as ${role}`);
+    console.log('Request body:', req.body);
+    
+    if (!['Consultant', 'Client', 'Unassigned'].includes(role)) {
+        return res.status(400).json({ error: 'Role must be Consultant, Client, or Unassigned' });
+    }
+    
+    // Make sure speaker exists in detected speakers
+    if (!detectedSpeakers.has(speakerId)) {
+        console.log(`⚠️ Speaker ${speakerId} not in detected speakers, adding...`);
+        detectedSpeakers.add(speakerId);
+    }
+    
+    speakerMapping.set(speakerId, role);
+    console.log(`👤 Speaker ${speakerId} assigned as ${role}`);
+    console.log('Current speaker mapping:', Array.from(speakerMapping.entries()));
+    console.log('Detected speakers:', Array.from(detectedSpeakers));
+    
+    res.json({
+        success: true,
+        speakerId,
+        role,
+        message: `Speaker ${speakerId} assigned as ${role}`,
+        currentMapping: Array.from(speakerMapping.entries()),
+        detectedSpeakers: Array.from(detectedSpeakers)
+    });
+});
+
+// Debug endpoint to see current speaker state
+app.get('/api/debug/speakers', (req, res) => {
+    res.json({
+        detectedSpeakers: Array.from(detectedSpeakers),
+        speakerMapping: Array.from(speakerMapping.entries()),
+        currentSpeakerId: currentSpeakerId,
+        lastTranscriptSpeaker: lastTranscriptSpeaker,
+        timestamp: new Date().toISOString(),
+        recentTranscripts: global.liveTranscripts.slice(-5) // Last 5 transcripts
+    });
 });
 
 // Keep the existing API routes
@@ -920,6 +1197,12 @@ app.post('/webhook', (req, res) => {
           strategicQuestions: []
         };
         
+        // Reset speaker tracking
+        speakerMapping.clear();
+        detectedSpeakers.clear();
+        currentSpeakerId = null;
+        global.liveTranscripts = [];
+        
         console.log(`📞 Meeting ID: ${conversationId}`);
         console.log('🤖 AI Financial Assistant is now monitoring the consultation...\n');
         
@@ -935,6 +1218,9 @@ app.post('/webhook', (req, res) => {
         
         cleanupMeeting(meeting_uuid);
         displayCurrentFinancialData();
+        
+        // Keep speaker tracking for post-meeting review
+        console.log('Final speaker mapping:', Array.from(speakerMapping.entries()));
     }
 
     res.sendStatus(200);
@@ -995,42 +1281,42 @@ async function handleAssemblyAIMessage(data, meetingUuid) {
 
     if (msgType === "Begin") {
         console.log(`🚀 AssemblyAI session started: ${data.id}`);
-        // Clear previous transcripts when new session starts
         global.liveTranscripts = [];
     } else if (msgType === "Turn") {
         const transcript = data.transcript || "";
         const formatted = data.turn_is_formatted;
 
         if (formatted && transcript.trim()) {
-            // Final transcript - add to live transcripts
+            // Add speaker label to transcript
+            const speakerRole = speakerMapping.get(currentSpeakerId) || `Speaker ${currentSpeakerId}`;
+            const labeledTranscript = `${speakerRole}: ${transcript}`;
+            
+            // Add to live transcripts with speaker info
             global.liveTranscripts.push({
                 timestamp: new Date().toLocaleTimeString(),
-                text: transcript,
+                text: labeledTranscript,
+                speaker: speakerRole,
+                speakerId: currentSpeakerId,
                 type: 'final'
             });
             
-            // Keep only last 50 entries to prevent memory issues
+            // Keep only last 50 entries
             if (global.liveTranscripts.length > 50) {
                 global.liveTranscripts = global.liveTranscripts.slice(-50);
             }
             
             process.stdout.write('\r' + ' '.repeat(100) + '\r');
-            console.log(`📝 [${meetingUuid.substring(0, 8)}] FINAL: ${transcript}`);
+            console.log(`📝 [${speakerRole}] ${transcript}`);
             
-            // Process transcript for financial consultation insights
-            await processTranscript(transcript);
-            
-            // Display updated dashboard
+            // Send labeled transcript to AI
+            await processTranscript(labeledTranscript);
             displayCurrentFinancialData();
         } else if (!formatted && transcript.trim()) {
-            // Partial transcript
-            process.stdout.write(`\r🎙️  [${meetingUuid.substring(0, 8)}] ${transcript}`);
+            const speakerRole = speakerMapping.get(currentSpeakerId) || `Speaker ${currentSpeakerId}`;
+            process.stdout.write(`\r🎙️ [${speakerRole}] ${transcript}`);
         }
     } else if (msgType === "Termination") {
         console.log(`\n🏁 AssemblyAI session terminated for ${meetingUuid}`);
-        
-        // Final consultation summary
-        console.log('\n💼 FINAL FINANCIAL CONSULTATION SUMMARY:');
         displayCurrentFinancialData();
     }
 }
@@ -1146,9 +1432,10 @@ function connectToMediaWebSocket(mediaUrl, meetingUuid, streamId, signalingSocke
                 }));
             }
 
-            // Handle audio data (msg_type 14 with Base64 data)
+            // UPDATED: Handle audio data with speaker tracking
             if (msg.msg_type === 14 && msg.content?.data) {
-                handleAudioData(msg.content.data, meetingUuid);
+                const speakerId = msg.content.user_id !== undefined ? msg.content.user_id : 0;
+                handleAudioDataWithSpeaker(msg.content.data, meetingUuid, speakerId);
             }
 
         } catch (err) {
@@ -1168,25 +1455,42 @@ function connectToMediaWebSocket(mediaUrl, meetingUuid, streamId, signalingSocke
     });
 }
 
-function handleAudioData(base64Data, meetingUuid) {
+// ENHANCED: Speaker tracking with better solo testing support
+function handleAudioDataWithSpeaker(base64Data, meetingUuid, speakerId) {
     const collector = audioCollectors.get(meetingUuid);
     if (!collector || collector.stopRequested) return;
 
-    // Decode base64 to raw audio buffer
+    // Track new speakers
+    if (!detectedSpeakers.has(speakerId)) {
+        detectedSpeakers.add(speakerId);
+        console.log(`👤 New speaker detected: ${speakerId}`);
+        
+        // For solo testing, auto-assign as Consultant first
+        if (speakerMapping.size === 0) {
+            speakerMapping.set(speakerId, 'Consultant');
+            console.log(`🏢 Auto-assigned Speaker ${speakerId} as Consultant`);
+        }
+    }
+
+    // Track speaker changes (including first time setting)
+    if (currentSpeakerId !== speakerId) {
+        currentSpeakerId = speakerId;
+        const role = speakerMapping.get(speakerId) || `Speaker ${speakerId}`;
+        console.log(`🎙️ Speaker changed to: ${role} (ID: ${speakerId})`);
+    }
+
+    // Continue with existing audio processing
     const audioBuffer = Buffer.from(base64Data, 'base64');
-    
-    // Store for post-meeting processing
     collector.audioChunks.push(audioBuffer);
     collector.totalBytes += audioBuffer.length;
     collector.chunkCount++;
 
-    // Send to AssemblyAI streaming
     sendToAssemblyAI(audioBuffer, meetingUuid);
 
-    // Log progress every 100 chunks
     if (collector.chunkCount % 100 === 0) {
         const duration = (Date.now() - collector.startTime) / 1000;
-        console.log(`🎵 [${meetingUuid.substring(0, 8)}] ${collector.chunkCount} chunks, ${collector.totalBytes} bytes, ${duration.toFixed(1)}s`);
+        const role = speakerMapping.get(speakerId) || `Speaker ${speakerId}`;
+        console.log(`🎵 [${role}] ${collector.chunkCount} chunks, ${collector.totalBytes} bytes, ${duration.toFixed(1)}s`);
     }
 }
 
@@ -1291,8 +1595,7 @@ function getSystemPrompt(callContext) {
     Your role is to provide valuable insights to the financial advisor by analyzing the consultation as it unfolds. 
     Only make updates that help the advisor better serve their client. The insights you are providing should be regarding the client.
 
-    The conversation may or may not be labeled with speakers (Advisor: or Client:) to help you understand who is speaking.
-    If the conversations is not labeled, do your best to infer who is speaking.
+    The conversation is labeled with speakers (Consultant: or Client:) to help you understand who is speaking.
     You should focus on identifying key information about the client's financial situation, goals, concerns, and opportunities while 
     maintaining an organized understanding of the consultation's progress.
     
@@ -1571,6 +1874,7 @@ async function processRecordedAudio(meetingId, audioChunks) {
         timestamp: new Date().toISOString(),
         financialData,
         conversationHistory,
+        speakerMapping: Array.from(speakerMapping.entries()),
         fullTranscript: transcript.text
       };
       
@@ -1604,6 +1908,8 @@ async function convertRawToWav(rawFilename, wavFilename) {
 const server = app.listen(PORT, () => {
   console.log(`🌐 Financial Consultation Intelligence System running at http://localhost:${PORT}`);
   console.log(`🔗 Webhook endpoint at http://localhost:${PORT}/webhook`);
+  console.log(`🐛 Debug mode available at http://localhost:${PORT}/?debug=1`);
+  console.log(`🔍 Debug API at http://localhost:${PORT}/api/debug/speakers`);
   console.log('💡 Make sure your environment variables are set in .env\n');
 });
 
