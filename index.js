@@ -22,14 +22,41 @@ const ZOOM_SECRET_TOKEN = process.env.ZOOM_SECRET_TOKEN;
 const CLIENT_ID = process.env.ZM_CLIENT_ID;
 const CLIENT_SECRET = process.env.ZM_CLIENT_SECRET;
 
-// Debug log the environment variables
-console.log('🔍 Environment Variables Check:');
-console.log('ZOOM_SECRET_TOKEN:', ZOOM_SECRET_TOKEN ? '✅ Set' : '❌ Missing');
-console.log('ZM_CLIENT_ID:', CLIENT_ID ? '✅ Set' : '❌ Missing');
-console.log('ZM_CLIENT_SECRET:', CLIENT_SECRET ? '✅ Set' : '❌ Missing');
-console.log('ASSEMBLYAI_API_KEY:', process.env.ASSEMBLYAI_API_KEY ? '✅ Set' : '❌ Missing');
-console.log('ANTHROPIC_API_KEY:', process.env.ANTHROPIC_API_KEY ? '✅ Set' : '❌ Missing');
-console.log('');
+// Audio stream options
+const AUDIO_MULTI_STREAMS = 1;  // Individual participant streams
+const AUDIO_MIXED_STREAM = 0;   // Single mixed stream
+
+// CORRECTED: Audio parameter constants based on documentation
+const AUDIO_SAMPLE_RATES = {
+    SR_8K: 0,
+    SR_16K: 1,
+    SR_32K: 2,
+    SR_48K: 3
+};
+
+const AUDIO_CHANNELS = {
+    MONO: 1,      
+    STEREO: 2
+};
+
+const AUDIO_CODECS = {
+    L16: 1,       
+    G711: 2,
+    G722: 3,
+    OPUS: 4
+};
+
+const MEDIA_CONTENT_TYPES = {
+    RAW_AUDIO: 2, 
+};
+
+const MEDIA_DATA_OPTIONS = {
+    AUDIO_MIXED_STREAM: 1,
+    AUDIO_MULTI_STREAMS: 2,  
+};
+
+// Performance optimization: reduce debug logging
+const DEBUG_ENABLED = process.env.DEBUG_MODE === 'true';
 
 // Financial Consultation Analysis Setup
 const anthropic = new Anthropic({
@@ -48,7 +75,7 @@ let financialData = {
     need: "Not identified",
     timing: "Not identified"
   },
-  clientInfo: "Not identified",
+  clientInfo: [],
   advisorReminders: [],
   concerns: [],
   strategicQuestions: []
@@ -57,17 +84,24 @@ let financialData = {
 // Global transcript storage
 global.liveTranscripts = [];
 
+// Enhanced speaker tracking with detailed logging
+const speakerTracking = {
+  detectedUsers: new Map(), 
+  speakerTransitions: [], 
+  debugMode: DEBUG_ENABLED
+};
+
 // Speaker management
-const speakerMapping = new Map(); // Maps user_id to role (Consultant/Client)
-const detectedSpeakers = new Set(); // Track all detected user_ids
+const speakerMapping = new Map(); 
+const detectedSpeakers = new Set(); 
 let currentSpeakerId = null;
 let lastTranscriptSpeaker = null;
 
-// Audio streaming configuration
+// Audio streaming configuration (optimized chunk sizes)
 const SAMPLE_RATE = 16000;
 const CHANNELS = 1;
 const BYTES_PER_SAMPLE = 2;
-const TARGET_CHUNK_DURATION_MS = 100;
+const TARGET_CHUNK_DURATION_MS = 250; // Increased for better performance
 const TARGET_CHUNK_SIZE = (SAMPLE_RATE * CHANNELS * BYTES_PER_SAMPLE * TARGET_CHUNK_DURATION_MS) / 1000;
 
 // Keep track of active connections and audio collectors per meeting
@@ -86,13 +120,13 @@ const API_ENDPOINT = `${API_ENDPOINT_BASE_URL}?${querystring.stringify(CONNECTIO
 const app = express();
 const PORT = 8080;
 
-// FIXED: Security middleware with helmet - allowing inline event handlers
+// Optimized helmet configuration
 app.use(helmet({
   contentSecurityPolicy: {
     directives: {
       defaultSrc: ["'self'"],
       scriptSrc: ["'self'", "'unsafe-inline'"],
-      scriptSrcAttr: ["'unsafe-inline'"], // This allows inline event handlers
+      scriptSrcAttr: ["'unsafe-inline'"],
       styleSrc: ["'self'", "'unsafe-inline'"],
       imgSrc: ["'self'", "data:", "https:"],
       connectSrc: ["'self'"],
@@ -103,7 +137,7 @@ app.use(helmet({
     },
   },
   hsts: {
-    maxAge: 31536000,
+    maxAge: 31536000, // 1 year in seconds
     includeSubDomains: true,
     preload: true
   },
@@ -117,17 +151,40 @@ app.use(express.static('public'));
 app.use(express.json());
 app.use(express.raw({type: 'application/json'}));
 
-// Financial Consultation Tools
+// Optimized speaker event logging (only when debug enabled)
+function logSpeakerEvent(event, data) {
+  if (!DEBUG_ENABLED) return;
+  
+  const timestamp = new Date().toISOString();
+  const logEntry = {
+    timestamp,
+    event,
+    data,
+    currentSpeaker: currentSpeakerId,
+    totalDetectedUsers: speakerTracking.detectedUsers.size
+  };
+  
+  console.log(`🎤 ${event}: Speaker ${data.speakerId || currentSpeakerId}`);
+  
+  speakerTracking.speakerTransitions.push(logEntry);
+  
+  // Keep only last 50 events for memory efficiency
+  if (speakerTracking.speakerTransitions.length > 50) {
+    speakerTracking.speakerTransitions = speakerTracking.speakerTransitions.slice(-25);
+  }
+}
+
+// Optimized Financial Consultation Tools (reduced descriptions for faster processing)
 const TOOLS = [
   {
     name: "update_summary",
-    description: "Add a new bullet point to the consultation summary when there's significant new financial information. Each bullet should be brief and concise. Only add a new bullet when there's meaningful new information to add.",
+    description: "Add a new bullet point to the consultation summary.",
     input_schema: {
       type: "object",
       properties: {
         new_point: {
           type: "string",
-          description: "A single new bullet point summarizing the latest significant financial development (without bullet symbol)"
+          description: "A single new bullet point"
         }
       },
       required: ["new_point"]
@@ -135,79 +192,52 @@ const TOOLS = [
   },
   {
     name: "update_faint",
-    description: "Update the FAINT (Funds, Authority, Interest, Need, Timing) financial qualification assessment based on the consultation",
+    description: "Update specific FAINT qualification fields. Only provide fields that have new/updated information.",
     input_schema: {
       type: "object",
       properties: {
-        funds: {
-          type: "string",
-          description: "Identified financial capacity, assets, income, or investment capital information, or 'Not identified'"
-        },
-        authority: {
-          type: "string",
-          description: "Identified decision-making authority for financial decisions or 'Not identified'"
-        },
-        interest: {
-          type: "string",
-          description: "Identified level of interest in financial products/services or investment appetite, or 'Not identified'"
-        },
-        need: {
-          type: "string",
-          description: "Identified financial needs, goals, or problems to solve, or 'Not identified'"
-        },
-        timing: {
-          type: "string",
-          description: "Identified timeline for financial decisions or implementation, or 'Not identified'"
-        }
+        funds: { type: "string", description: "Financial capacity info" },
+        authority: { type: "string", description: "Decision-making authority" },
+        interest: { type: "string", description: "Investment interest level" },
+        need: { type: "string", description: "Financial needs/goals" },
+        timing: { type: "string", description: "Timeline for decisions" }
       },
-      required: ["funds", "authority", "interest", "need", "timing"]
+      required: []
     }
   },
   {
     name: "update_client_info",
-    description: "Update information about the client when new personal or financial details are discovered.",
+    description: "Add client information.",
     input_schema: {
       type: "object",
       properties: {
-        clientInfo: {
-          type: "string",
-          description: "Key information about the client's personal situation, family, career, or financial background."
-        }
+        new_info: { type: "string", description: "New client information" }
       },
-      required: ["clientInfo"]
+      required: ["new_info"]
     }
   },
   {
     name: "update_advisor_reminders",
-    description: "Add a new bullet point reminder when there's an important new suggestion for the financial advisor. Each reminder should be brief and actionable. Only add a new bullet when there's a meaningful new reminder.",
+    description: "Add advisor reminder.",
     input_schema: {
       type: "object",
       properties: {
-        new_reminder: {
-          type: "string",
-          description: "A single new bullet point reminder for the advisor (without bullet symbol)"
-        }
+        new_reminder: { type: "string", description: "Reminder for advisor" }
       },
       required: ["new_reminder"]
     }
   },
   {
     name: "update_concerns",
-    description: "Add a new client concern and addressing strategy when a new worry or hesitation is identified. Only add when there's a clear new concern.",
+    description: "Add client concern.",
     input_schema: {
       type: "object",
       properties: {
         new_concern: {
           type: "object",
           properties: {
-            concern: {
-              type: "string",
-              description: "The new client concern or worry (brief)"
-            },
-            addressing_strategy: {
-              type: "string",
-              description: "Suggested approach to address this concern (brief)"
-            }
+            concern: { type: "string", description: "Client concern" },
+            addressing_strategy: { type: "string", description: "How to address it" }
           },
           required: ["concern", "addressing_strategy"]
         }
@@ -217,21 +247,15 @@ const TOOLS = [
   },
   {
     name: "update_strategic_questions",
-    description: "Add strategic questions the advisor should ask to gather more useful information about the client's financial situation, goals, or concerns. Only add when there are clear information gaps that specific questions could fill.",
+    description: "Add strategic question.",
     input_schema: {
       type: "object",
       properties: {
         new_question: {
           type: "object",
           properties: {
-            question: {
-              type: "string",
-              description: "A specific, actionable question the advisor should ask (brief)"
-            },
-            purpose: {
-              type: "string",
-              description: "Why this question would be valuable - what information it would reveal (brief)"
-            }
+            question: { type: "string", description: "Question to ask" },
+            purpose: { type: "string", description: "Why ask this" }
           },
           required: ["question", "purpose"]
         }
@@ -241,7 +265,7 @@ const TOOLS = [
   }
 ];
 
-// Single simplified dashboard route
+// Dashboard route with configurable update interval, pause button, and collapsible sections
 app.get('/', (req, res) => {
   res.send(`
     <!DOCTYPE html>
@@ -296,7 +320,7 @@ app.get('/', (req, res) => {
                 color: white;
                 padding: 12px 30px;
                 display: grid;
-                grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+                grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
                 gap: 20px;
                 font-size: 0.9em;
                 border-bottom: 1px solid rgba(255, 255, 255, 0.1);
@@ -314,6 +338,55 @@ app.get('/', (req, res) => {
             
             .status-value {
                 font-weight: 600;
+            }
+            
+            .update-interval-control {
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                background: rgba(255, 255, 255, 0.1);
+                padding: 6px 12px;
+                border-radius: 6px;
+                border: 1px solid rgba(255, 255, 255, 0.2);
+            }
+            
+            .update-interval-input {
+                width: 60px;
+                padding: 4px 6px;
+                border: 1px solid rgba(255, 255, 255, 0.3);
+                border-radius: 4px;
+                background: rgba(255, 255, 255, 0.9);
+                color: #333;
+                font-size: 0.85em;
+                text-align: center;
+            }
+            
+            .update-interval-unit {
+                font-size: 0.8em;
+                opacity: 0.8;
+            }
+            
+            .pause-button {
+                padding: 4px 8px;
+                border: 1px solid rgba(255, 255, 255, 0.3);
+                border-radius: 4px;
+                background: rgba(255, 255, 255, 0.9);
+                color: #333;
+                font-size: 0.8em;
+                cursor: pointer;
+                transition: all 0.2s ease;
+                font-weight: 500;
+            }
+            
+            .pause-button:hover {
+                background: rgba(255, 255, 255, 1);
+                transform: translateY(-1px);
+            }
+            
+            .pause-button.paused {
+                background: #dc3545;
+                color: white;
+                border-color: #dc3545;
             }
             
             .tabs {
@@ -457,6 +530,46 @@ app.get('/', (req, res) => {
                 display: flex;
                 align-items: center;
                 gap: 8px;
+                justify-content: space-between;
+            }
+            
+            .section-title-left {
+                display: flex;
+                align-items: center;
+                gap: 8px;
+            }
+            
+            .expand-button {
+                background: #f8f9fa;
+                border: 1px solid #dee2e6;
+                border-radius: 4px;
+                padding: 4px 8px;
+                font-size: 0.8em;
+                cursor: pointer;
+                transition: all 0.2s ease;
+                color: #495057;
+                font-weight: 500;
+            }
+            
+            .expand-button:hover {
+                background: #e9ecef;
+                border-color: #adb5bd;
+            }
+            
+            .expand-button.expanded {
+                background: #007bff;
+                border-color: #007bff;
+                color: white;
+            }
+            
+            .item-count {
+                background: #6c757d;
+                color: white;
+                border-radius: 12px;
+                padding: 2px 8px;
+                font-size: 0.75em;
+                font-weight: 600;
+                margin-left: 8px;
             }
             
             .faint-grid {
@@ -492,12 +605,24 @@ app.get('/', (req, res) => {
                 line-height: 1.5;
             }
             
+            .list-item.latest {
+                border-left-color: #007bff;
+                background: linear-gradient(135deg, #e7f3ff 0%, #f0f8ff 100%);
+                box-shadow: 0 2px 8px rgba(0, 123, 255, 0.15);
+            }
+            
             .concern-item {
                 margin: 12px 0;
                 padding: 16px;
                 background: linear-gradient(135deg, #fff5f5 0%, #fed7d7 20%);
                 border-radius: 8px;
                 border-left: 4px solid #e53e3e;
+            }
+            
+            .concern-item.latest {
+                border-left-color: #dc3545;
+                background: linear-gradient(135deg, #f8d7da 0%, #f5c6cb 20%);
+                box-shadow: 0 2px 8px rgba(220, 53, 69, 0.15);
             }
             
             .concern-item strong {
@@ -512,8 +637,22 @@ app.get('/', (req, res) => {
                 border-left: 4px solid #3182ce;
             }
             
+            .question-item.latest {
+                border-left-color: #0056b3;
+                background: linear-gradient(135deg, #cce7ff 0%, #b3d9ff 20%);
+                box-shadow: 0 2px 8px rgba(0, 86, 179, 0.15);
+            }
+            
             .question-item strong {
                 color: #2b6cb0;
+            }
+            
+            .expanded-items {
+                display: none;
+            }
+            
+            .expanded-items.show {
+                display: block;
             }
             
             .transcript-container {
@@ -631,6 +770,28 @@ app.get('/', (req, res) => {
                 color: #5f6368;
             }
             
+            .debug-links {
+                margin-top: 10px;
+                display: flex;
+                gap: 10px;
+                flex-wrap: wrap;
+            }
+            
+            .debug-link {
+                background: #007bff;
+                color: white;
+                padding: 5px 10px;
+                border-radius: 4px;
+                text-decoration: none;
+                font-size: 0.8em;
+                transition: background 0.2s;
+            }
+            
+            .debug-link:hover {
+                background: #0056b3;
+                color: white;
+            }
+            
             /* Custom scrollbar */
             ::-webkit-scrollbar {
                 width: 8px;
@@ -710,6 +871,14 @@ app.get('/', (req, res) => {
                     <span class="status-label">Last Update:</span>
                     <span id="last-update" class="status-value">Never</span>
                 </div>
+                <div class="status-item">
+                    <div class="update-interval-control">
+                        <span class="status-label">Update Every:</span>
+                        <input type="number" id="update-interval" class="update-interval-input" value="3000" min="500" max="30000" step="500">
+                        <span class="update-interval-unit">ms</span>
+                        <button id="pause-button" class="pause-button">⏸️ Pause</button>
+                    </div>
+                </div>
             </div>
 
             <div class="tabs">
@@ -757,7 +926,10 @@ app.get('/', (req, res) => {
         <script>
             let transcriptData = [];
             let isActiveCall = false;
-            let debugMode = false;
+            let debugMode = ${DEBUG_ENABLED};
+            let updateInterval = 3000; // Default 3000ms
+            let updateTimeoutId = null;
+            let isPaused = false;
 
             // Enable debug mode by adding ?debug=1 to URL
             if (window.location.search.includes('debug=1')) {
@@ -765,8 +937,57 @@ app.get('/', (req, res) => {
                 console.log('🐛 Debug mode enabled');
             }
 
+            // Load saved update interval from localStorage
+            const savedInterval = localStorage.getItem('updateInterval');
+            if (savedInterval) {
+                updateInterval = parseInt(savedInterval);
+                document.getElementById('update-interval').value = updateInterval;
+            }
+
+            // Handle update interval changes
+            document.getElementById('update-interval').addEventListener('change', function() {
+                const newInterval = parseInt(this.value);
+                if (newInterval >= 500 && newInterval <= 30000) {
+                    updateInterval = newInterval;
+                    localStorage.setItem('updateInterval', updateInterval);
+                    console.log(\`⏱️ Update interval changed to \${updateInterval}ms\`);
+                    
+                    // Restart the update cycle with new interval if not paused
+                    if (!isPaused) {
+                        if (updateTimeoutId) {
+                            clearTimeout(updateTimeoutId);
+                        }
+                        scheduleUpdate();
+                    }
+                } else {
+                    this.value = updateInterval; // Reset to valid value
+                    alert('Update interval must be between 500ms and 30000ms');
+                }
+            });
+
+            // Handle pause/resume button
+            document.getElementById('pause-button').addEventListener('click', function() {
+                if (isPaused) {
+                    // Resume
+                    isPaused = false;
+                    this.textContent = '⏸️ Pause';
+                    this.classList.remove('paused');
+                    console.log('▶️ Updates resumed');
+                    scheduleUpdate();
+                } else {
+                    // Pause
+                    isPaused = true;
+                    this.textContent = '▶️ Resume';
+                    this.classList.add('paused');
+                    console.log('⏸️ Updates paused');
+                    if (updateTimeoutId) {
+                        clearTimeout(updateTimeoutId);
+                        updateTimeoutId = null;
+                    }
+                }
+            });
+
             function showTab(tabName) {
-                // Hide all tabs
                 document.querySelectorAll('.tab-content').forEach(tab => {
                     tab.classList.remove('active');
                 });
@@ -774,11 +995,27 @@ app.get('/', (req, res) => {
                     tab.classList.remove('active');
                 });
 
-                // Show selected tab
                 document.getElementById(tabName + '-tab').classList.add('active');
-                
-                // Find and activate the clicked tab
                 document.querySelector(\`[data-tab="\${tabName}"]\`).classList.add('active');
+            }
+
+            function toggleExpand(sectionId) {
+                const expandedItems = document.getElementById(\`\${sectionId}-expanded\`);
+                const button = document.getElementById(\`\${sectionId}-expand-btn\`);
+                
+                if (expandedItems && button) {
+                    const isExpanded = expandedItems.classList.contains('show');
+                    
+                    if (isExpanded) {
+                        expandedItems.classList.remove('show');
+                        button.textContent = 'Show All';
+                        button.classList.remove('expanded');
+                    } else {
+                        expandedItems.classList.add('show');
+                        button.textContent = 'Show Latest';
+                        button.classList.add('expanded');
+                    }
+                }
             }
 
             async function updateSpeakers() {
@@ -789,11 +1026,17 @@ app.get('/', (req, res) => {
                     if (debugMode) {
                         console.log('🐛 Speakers data:', data);
                         document.getElementById('debug-info').style.display = 'block';
+                        
+                        const pauseStatus = isPaused ? ' [PAUSED]' : '';
                         document.getElementById('debug-info').innerHTML = \`
-                            <strong>Debug Info:</strong><br>
+                            <strong>Debug Info (Update: \${updateInterval}ms\${pauseStatus}):</strong><br>
                             Detected Speakers: \${JSON.stringify(data.speakers)}<br>
                             Current Speaker: \${data.currentSpeaker}<br>
-                            <a href="/api/debug/speakers" target="_blank">View Full Debug</a>
+                            <div class="debug-links">
+                                <a href="/api/debug/speakers" target="_blank" class="debug-link">Basic Debug</a>
+                                <a href="/api/debug/speakers/detailed" target="_blank" class="debug-link">Detailed Analysis</a>
+                                <a href="/api/debug/speakers/export" class="debug-link">Export Logs</a>
+                            </div>
                         \`;
                     }
                     
@@ -825,7 +1068,6 @@ app.get('/', (req, res) => {
                     </div>
                 \`).join('');
 
-                // Add event listeners to selects (replacing inline handlers)
                 document.querySelectorAll('.speaker-select').forEach(select => {
                     select.addEventListener('change', function() {
                         const speakerId = this.getAttribute('data-speaker-id');
@@ -836,8 +1078,6 @@ app.get('/', (req, res) => {
             }
 
             async function assignSpeaker(speakerId, role) {
-                console.log(\`🔄 Attempting to assign Speaker \${speakerId} as \${role}\`);
-                
                 try {
                     const response = await fetch('/api/speakers/assign', {
                         method: 'POST',
@@ -847,21 +1087,11 @@ app.get('/', (req, res) => {
                         body: JSON.stringify({ speakerId: parseInt(speakerId), role })
                     });
                     
-                    const result = await response.json();
-                    console.log('✅ Assignment response:', result);
-                    
                     if (response.ok) {
-                        console.log(\`✅ Speaker \${speakerId} assigned as \${role}\`);
-                        
-                        // Force immediate refresh
                         await updateSpeakers();
-                        
-                        // Also refresh transcript to show new labels
                         setTimeout(async () => {
                             await updateDashboard();
                         }, 100);
-                    } else {
-                        console.error('❌ Assignment failed:', result);
                     }
                 } catch (error) {
                     console.error('❌ Error assigning speaker:', error);
@@ -869,12 +1099,12 @@ app.get('/', (req, res) => {
             }
 
             async function updateDashboard() {
+                if (isPaused) return; // Skip updates when paused
+                
                 try {
-                    // Get system status
                     const statusResponse = await fetch('/api/status');
                     const statusData = await statusResponse.json();
                     
-                    // Update status bar
                     document.getElementById('system-status').innerHTML = 
                         statusData.status === 'active' ? 
                         '<span class="status-active">🟢 ACTIVE</span>' : 
@@ -886,31 +1116,31 @@ app.get('/', (req, res) => {
                         '<span class="status-active">✅ ONLINE</span>' : 
                         '<span class="status-inactive">❌ OFFLINE</span>';
                     
+                    const now = new Date();
+                    const pauseStatus = isPaused ? ' [PAUSED]' : '';
                     document.getElementById('last-update').textContent = 
-                        new Date().toLocaleTimeString();
+                        \`\${now.toLocaleTimeString()} (\${updateInterval}ms\${pauseStatus})\`;
 
                     isActiveCall = statusData.status === 'active';
 
-                    // Update speakers
                     await updateSpeakers();
 
-                    // Get financial data if call is active
                     if (isActiveCall) {
                         const dashResponse = await fetch('/api/dashboard');
                         const dashData = await dashResponse.json();
                         updateFinancialDashboard(dashData.financial_data);
                         
-                        // Get transcript data
                         const transcriptResponse = await fetch('/api/transcript');
                         const transcriptDataResponse = await transcriptResponse.json();
                         updateTranscript(transcriptDataResponse.transcripts || []);
                     } else {
-                        // Show waiting state
+                        const pauseStatusText = isPaused ? \` [Updates paused at \${updateInterval}ms intervals]\` : \` [Updating every \${updateInterval}ms]\`;
                         document.getElementById('financial-dashboard').innerHTML = \`
                             <div class="empty-state">
                                 <div class="pulse">💤</div>
                                 <h3>Waiting for consultation to begin...</h3>
                                 <p>Start a Zoom meeting with RTMS enabled to see live financial intelligence.</p>
+                                <p style="margin-top: 10px; font-size: 0.9em; opacity: 0.8;">\${pauseStatusText}</p>
                             </div>
                         \`;
                         
@@ -919,6 +1149,7 @@ app.get('/', (req, res) => {
                                 <div class="pulse">🎙️</div>
                                 <h3>Waiting for live transcription...</h3>
                                 <p>Transcript will appear here when the consultation begins.</p>
+                                <p style="margin-top: 10px; font-size: 0.9em; opacity: 0.6;">\${pauseStatusText}</p>
                             </div>
                         \`;
                     }
@@ -931,15 +1162,48 @@ app.get('/', (req, res) => {
             function updateFinancialDashboard(data) {
                 const dashboard = document.getElementById('financial-dashboard');
                 
+                // Helper function to create collapsible section
+                function createCollapsibleSection(sectionId, title, items, renderItem, emptyMessage) {
+                    if (!items || items.length === 0) {
+                        return \`
+                            <div class="dashboard-section">
+                                <div class="section-title">
+                                    <div class="section-title-left">\${title}</div>
+                                </div>
+                                <div style="color: #6c757d; font-style: italic; padding: 20px; text-align: center;">\${emptyMessage}</div>
+                            </div>
+                        \`;
+                    }
+                    
+                    const hasMultiple = items.length > 1;
+                    const latestItem = items[items.length - 1];
+                    const olderItems = items.slice(0, -1);
+                    
+                    return \`
+                        <div class="dashboard-section">
+                            <div class="section-title">
+                                <div class="section-title-left">
+                                    \${title}
+                                    <span class="item-count">\${items.length}</span>
+                                </div>
+                                \${hasMultiple ? \`<button class="expand-button" id="\${sectionId}-expand-btn" onclick="toggleExpand('\${sectionId}')">Show All</button>\` : ''}
+                            </div>
+                            
+                            <!-- Latest item -->
+                            \${renderItem(latestItem, items.length - 1, true)}
+                            
+                            <!-- Older items (hidden by default) -->
+                            \${hasMultiple ? \`
+                                <div class="expanded-items" id="\${sectionId}-expanded">
+                                    \${olderItems.map((item, index) => renderItem(item, index, false)).join('')}
+                                </div>
+                            \` : ''}
+                        </div>
+                    \`;
+                }
+                
                 dashboard.innerHTML = \`
-                    <div class="dashboard-section">
-                        <div class="section-title">📝 Consultation Summary</div>
-                        \${data.summary && data.summary.length > 0 ? 
-                            data.summary.map((point, i) => \`<div class="list-item">\${i + 1}. \${point}</div>\`).join('') :
-                            '<div style="color: #6c757d; font-style: italic; padding: 20px; text-align: center;">No key points identified yet</div>'
-                        }
-                    </div>
-
+                    <!-- FAINT Qualification moved to top -->
                     <div class="dashboard-section">
                         <div class="section-title">💎 FAINT Qualification</div>
                         <div class="faint-grid">
@@ -960,44 +1224,55 @@ app.get('/', (req, res) => {
                         </div>
                     </div>
 
-                    <div class="dashboard-section">
-                        <div class="section-title">👤 Client Information</div>
-                        <div class="list-item">\${data.clientInfo || 'Not identified'}</div>
-                    </div>
+                    \${createCollapsibleSection(
+                        'clientInfo',
+                        '👤 Client Information',
+                        data.clientInfo,
+                        (info, index, isLatest) => \`<div class="list-item \${isLatest ? 'latest' : ''}">\${index + 1}. \${info}</div>\`,
+                        'No client information identified yet'
+                    )}
 
-                    <div class="dashboard-section">
-                        <div class="section-title">💡 Advisor Reminders</div>
-                        \${data.advisorReminders && data.advisorReminders.length > 0 ? 
-                            data.advisorReminders.map((reminder, i) => \`<div class="list-item">\${i + 1}. \${reminder}</div>\`).join('') :
-                            '<div style="color: #6c757d; font-style: italic; padding: 20px; text-align: center;">No reminders yet</div>'
-                        }
-                    </div>
+                    \${createCollapsibleSection(
+                        'summary',
+                        '📝 Consultation Summary',
+                        data.summary,
+                        (point, index, isLatest) => \`<div class="list-item \${isLatest ? 'latest' : ''}">\${index + 1}. \${point}</div>\`,
+                        'No key points identified yet'
+                    )}
 
-                    <div class="dashboard-section">
-                        <div class="section-title">⚠️ Client Concerns & Addressing</div>
-                        \${data.concerns && data.concerns.length > 0 ? 
-                            data.concerns.map((concern, i) => \`
-                                <div class="concern-item">
-                                    <strong>Concern:</strong> \${concern.concern}<br><br>
-                                    <strong>Strategy:</strong> \${concern.addressing_strategy}
-                                </div>
-                            \`).join('') :
-                            '<div style="color: #6c757d; font-style: italic; padding: 20px; text-align: center;">No concerns identified yet</div>'
-                        }
-                    </div>
+                    \${createCollapsibleSection(
+                        'reminders',
+                        '💡 Advisor Reminders',
+                        data.advisorReminders,
+                        (reminder, index, isLatest) => \`<div class="list-item \${isLatest ? 'latest' : ''}">\${index + 1}. \${reminder}</div>\`,
+                        'No reminders yet'
+                    )}
 
-                    <div class="dashboard-section">
-                        <div class="section-title">❓ Strategic Questions to Ask</div>
-                        \${data.strategicQuestions && data.strategicQuestions.length > 0 ? 
-                            data.strategicQuestions.map((question, i) => \`
-                                <div class="question-item">
-                                    <strong>\${i + 1}. Question:</strong> "\${question.question}"<br><br>
-                                    <strong>Purpose:</strong> \${question.purpose}
-                                </div>
-                            \`).join('') :
-                            '<div style="color: #6c757d; font-style: italic; padding: 20px; text-align: center;">No strategic questions suggested yet</div>'
-                        }
-                    </div>
+                    \${createCollapsibleSection(
+                        'concerns',
+                        '⚠️ Client Concerns & Addressing',
+                        data.concerns,
+                        (concern, index, isLatest) => \`
+                            <div class="concern-item \${isLatest ? 'latest' : ''}">
+                                <strong>Concern:</strong> \${concern.concern}<br><br>
+                                <strong>Strategy:</strong> \${concern.addressing_strategy}
+                            </div>
+                        \`,
+                        'No concerns identified yet'
+                    )}
+
+                    \${createCollapsibleSection(
+                        'questions',
+                        '❓ Strategic Questions to Ask',
+                        data.strategicQuestions,
+                        (question, index, isLatest) => \`
+                            <div class="question-item \${isLatest ? 'latest' : ''}">
+                                <strong>\${index + 1}. Question:</strong> "\${question.question}"<br><br>
+                                <strong>Purpose:</strong> \${question.purpose}
+                            </div>
+                        \`,
+                        'No strategic questions suggested yet'
+                    )}
                 \`;
             }
 
@@ -1005,17 +1280,18 @@ app.get('/', (req, res) => {
                 const container = document.getElementById('transcript-container');
                 
                 if (!transcripts || transcripts.length === 0) {
+                    const pauseStatus = isPaused ? ' [Updates paused]' : \` [Updating every \${updateInterval}ms]\`;
                     container.innerHTML = \`
                         <div class="empty-state-transcript">
                             <div class="pulse">🎙️</div>
                             <h3>No transcript data available yet...</h3>
                             <p>Transcription will appear here once the conversation begins.</p>
+                            <p style="margin-top: 10px; font-size: 0.9em; opacity: 0.6;">\${pauseStatus}</p>
                         </div>
                     \`;
                     return;
                 }
                 
-                // Group transcripts and format with speaker labels
                 const transcriptText = transcripts.map(entry => {
                     const speakerClass = entry.speaker ? entry.speaker.toLowerCase() : '';
                     const speakerIcon = entry.speaker === 'Consultant' ? '🏢' : entry.speaker === 'Client' ? '👤' : '🎙️';
@@ -1029,21 +1305,29 @@ app.get('/', (req, res) => {
                 }).join('');
                 
                 container.innerHTML = transcriptText;
-                
-                // Auto-scroll to bottom
                 container.scrollTop = container.scrollHeight;
+            }
+
+            // 🚀 CONFIGURABLE: Update scheduling with user-defined interval and pause functionality
+            function scheduleUpdate() {
+                if (isPaused) return; // Don't schedule if paused
+                
+                updateTimeoutId = setTimeout(() => {
+                    if (!isPaused) { // Double-check pause state
+                        updateDashboard().then(() => {
+                            scheduleUpdate(); // Schedule next update
+                        }).catch((error) => {
+                            console.error('Update error:', error);
+                            scheduleUpdate(); // Still schedule next update even if error
+                        });
+                    }
+                }, updateInterval);
             }
 
             // Initial load
             updateDashboard();
             
-            // Auto-refresh every 2 seconds during active calls, 5 seconds during standby
-            function scheduleUpdate() {
-                const interval = isActiveCall ? 2000 : 5000;
-                setTimeout(() => {
-                    updateDashboard().then(scheduleUpdate);
-                }, interval);
-            }
+            // Start the update cycle
             scheduleUpdate();
 
             // Add click event listeners for tabs
@@ -1055,13 +1339,20 @@ app.get('/', (req, res) => {
                     });
                 });
             });
+
+            // Cleanup on page unload
+            window.addEventListener('beforeunload', function() {
+                if (updateTimeoutId) {
+                    clearTimeout(updateTimeoutId);
+                }
+            });
         </script>
     </body>
     </html>
   `);
 });
 
-// Add API endpoint for transcript data
+// API endpoints (updated for client info as running list)
 app.get('/api/transcript', (req, res) => {
   res.json({
     transcripts: global.liveTranscripts || [],
@@ -1070,7 +1361,6 @@ app.get('/api/transcript', (req, res) => {
   });
 });
 
-// API endpoint to get detected speakers
 app.get('/api/speakers', (req, res) => {
     const speakers = Array.from(detectedSpeakers).map(speakerId => ({
         id: speakerId,
@@ -1085,54 +1375,87 @@ app.get('/api/speakers', (req, res) => {
     });
 });
 
-// API endpoint to assign speaker roles (ENHANCED WITH DEBUGGING)
 app.post('/api/speakers/assign', (req, res) => {
     let { speakerId, role } = req.body;
-    
-    // Ensure speakerId is a number
     speakerId = parseInt(speakerId);
     
-    console.log(`📝 Assigning Speaker ${speakerId} (type: ${typeof speakerId}) as ${role}`);
-    console.log('Request body:', req.body);
-    
     if (!['Consultant', 'Client', 'Unassigned'].includes(role)) {
-        return res.status(400).json({ error: 'Role must be Consultant, Client, or Unassigned' });
+        return res.status(400).json({ error: 'Invalid role' });
     }
     
-    // Make sure speaker exists in detected speakers
     if (!detectedSpeakers.has(speakerId)) {
-        console.log(`⚠️ Speaker ${speakerId} not in detected speakers, adding...`);
         detectedSpeakers.add(speakerId);
     }
     
     speakerMapping.set(speakerId, role);
-    console.log(`👤 Speaker ${speakerId} assigned as ${role}`);
-    console.log('Current speaker mapping:', Array.from(speakerMapping.entries()));
-    console.log('Detected speakers:', Array.from(detectedSpeakers));
+    if (speakerTracking.detectedUsers.has(speakerId)) {
+        speakerTracking.detectedUsers.get(speakerId).role = role;
+    }
+    
+    logSpeakerEvent('MANUAL_ROLE_ASSIGNMENT', {
+        speakerId,
+        newRole: role,
+        assignedBy: 'user'
+    });
     
     res.json({
         success: true,
         speakerId,
         role,
-        message: `Speaker ${speakerId} assigned as ${role}`,
-        currentMapping: Array.from(speakerMapping.entries()),
-        detectedSpeakers: Array.from(detectedSpeakers)
+        message: `Speaker ${speakerId} assigned as ${role}`
     });
 });
 
-// Debug endpoint to see current speaker state
+// Debug endpoints
 app.get('/api/debug/speakers', (req, res) => {
     res.json({
         detectedSpeakers: Array.from(detectedSpeakers),
         speakerMapping: Array.from(speakerMapping.entries()),
         currentSpeakerId: currentSpeakerId,
-        lastTranscriptSpeaker: lastTranscriptSpeaker,
         timestamp: new Date().toISOString(),
-        recentTranscripts: global.liveTranscripts.slice(-5) // Last 5 transcripts
+        recentTranscripts: global.liveTranscripts.slice(-5)
     });
 });
 
-// Keep the existing API routes
+app.get('/api/debug/speakers/detailed', (req, res) => {
+    const testReport = {
+        timestamp: new Date().toISOString(),
+        summary: {
+            totalDetectedUsers: speakerTracking.detectedUsers.size,
+            currentActiveSpeaker: currentSpeakerId,
+            totalSpeakerChanges: speakerTracking.speakerTransitions.length
+        },
+        detectedUsers: Array.from(speakerTracking.detectedUsers.entries()).map(([id, info]) => ({
+            userId: id,
+            assignedRole: speakerMapping.get(id) || 'Unassigned',
+            firstDetected: new Date(info.firstSeen).toISOString(),
+            lastActive: new Date(info.lastSeen).toISOString(),
+            totalAudioChunks: info.audioChunks,
+            isCurrentSpeaker: id === currentSpeakerId
+        })),
+        recentTransitions: speakerTracking.speakerTransitions.slice(-10)
+    };
+    
+    res.json(testReport);
+});
+
+app.get('/api/debug/speakers/export', (req, res) => {
+    const exportData = {
+        timestamp: new Date().toISOString(),
+        conversationId,
+        speakerTransitions: speakerTracking.speakerTransitions,
+        detectedUsers: Array.from(speakerTracking.detectedUsers.entries()),
+        speakerMapping: Array.from(speakerMapping.entries()),
+        transcripts: global.liveTranscripts
+    };
+    
+    const filename = `speaker_debug_${conversationId || 'no_meeting'}_${Date.now()}.json`;
+    
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.setHeader('Content-Type', 'application/json');
+    res.json(exportData);
+});
+
 app.get('/api/status', (req, res) => {
   res.json({
     system: 'Financial Consultation Intelligence System',
@@ -1160,7 +1483,6 @@ app.get('/api/dashboard', (req, res) => {
 
 // RTMS Webhook Handler
 app.post('/webhook', (req, res) => {
-    console.log('📡 RTMS Webhook received:', JSON.stringify(req.body, null, 2));
     const { event, payload } = req.body;
 
     if (event === 'endpoint.url_validation' && payload?.plainToken) {
@@ -1168,7 +1490,6 @@ app.post('/webhook', (req, res) => {
             .createHmac('sha256', ZOOM_SECRET_TOKEN)
             .update(payload.plainToken)
             .digest('hex');
-        console.log('✅ Responding to URL validation challenge');
         return res.json({
             plainToken: payload.plainToken,
             encryptedToken: hash,
@@ -1176,7 +1497,7 @@ app.post('/webhook', (req, res) => {
     }
 
     if (event === 'meeting.rtms_started') {
-        console.log('\n💼 STARTING FINANCIAL CONSULTATION ANALYSIS');
+        console.log('💼 STARTING FINANCIAL CONSULTATION ANALYSIS');
         const { meeting_uuid, rtms_stream_id, server_urls } = payload;
         
         // Initialize consultation
@@ -1191,7 +1512,7 @@ app.post('/webhook', (req, res) => {
             need: "Not identified",
             timing: "Not identified"
           },
-          clientInfo: "Not identified",
+          clientInfo: [],
           advisorReminders: [],
           concerns: [],
           strategicQuestions: []
@@ -1200,33 +1521,42 @@ app.post('/webhook', (req, res) => {
         // Reset speaker tracking
         speakerMapping.clear();
         detectedSpeakers.clear();
+        speakerTracking.detectedUsers.clear();
+        speakerTracking.speakerTransitions = [];
         currentSpeakerId = null;
         global.liveTranscripts = [];
         
-        console.log(`📞 Meeting ID: ${conversationId}`);
-        console.log('🤖 AI Financial Assistant is now monitoring the consultation...\n');
+        logSpeakerEvent('MEETING_STARTED', {
+            meetingId: conversationId,
+            streamId: rtms_stream_id
+        });
         
-        // Initialize audio collection and streaming for this meeting
+        console.log(`📞 Meeting ID: ${conversationId}`);
+        console.log('🤖 AI Assistant monitoring...');
+        
         initializeAudioCollection(meeting_uuid);
         initializeAssemblyAIStreaming(meeting_uuid);
         connectToSignalingWebSocket(meeting_uuid, rtms_stream_id, server_urls);
     }
 
     if (event === 'meeting.rtms_stopped') {
-        console.log('\n🏁 CONSULTATION ENDED - GENERATING FINAL REPORT');
+        console.log('🏁 CONSULTATION ENDED');
         const { meeting_uuid } = payload;
+        
+        logSpeakerEvent('MEETING_ENDED', {
+            meetingId: meeting_uuid,
+            totalUsers: speakerTracking.detectedUsers.size,
+            totalTransitions: speakerTracking.speakerTransitions.length
+        });
         
         cleanupMeeting(meeting_uuid);
         displayCurrentFinancialData();
-        
-        // Keep speaker tracking for post-meeting review
-        console.log('Final speaker mapping:', Array.from(speakerMapping.entries()));
     }
 
     res.sendStatus(200);
 });
 
-// Audio Collection Management
+// Audio Collection Management (unchanged from previous version)
 function initializeAudioCollection(meetingUuid) {
     audioCollectors.set(meetingUuid, {
         audioChunks: [],
@@ -1243,7 +1573,7 @@ function initializeAssemblyAIStreaming(meetingUuid) {
     const collector = audioCollectors.get(meetingUuid);
     if (!collector) return;
 
-    console.log(`🔗 Connecting to AssemblyAI streaming for meeting ${meetingUuid}`);
+    console.log(`🔗 Connecting to AssemblyAI for ${meetingUuid}`);
 
     const streamingWs = new WebSocket(API_ENDPOINT, {
         headers: {
@@ -1254,7 +1584,7 @@ function initializeAssemblyAIStreaming(meetingUuid) {
     collector.streamingWs = streamingWs;
 
     streamingWs.on('open', () => {
-        console.log(`✅ AssemblyAI streaming connected for meeting ${meetingUuid}`);
+        console.log(`✅ AssemblyAI connected`);
     });
 
     streamingWs.on('message', async (message) => {
@@ -1262,7 +1592,7 @@ function initializeAssemblyAIStreaming(meetingUuid) {
             const data = JSON.parse(message);
             await handleAssemblyAIMessage(data, meetingUuid);
         } catch (error) {
-            console.error(`❌ AssemblyAI message error: ${error}`);
+            console.error(`❌ AssemblyAI error: ${error}`);
         }
     });
 
@@ -1272,7 +1602,7 @@ function initializeAssemblyAIStreaming(meetingUuid) {
     });
 
     streamingWs.on('close', (code, reason) => {
-        console.log(`🔌 AssemblyAI streaming closed: ${code} - ${reason}`);
+        if (DEBUG_ENABLED) console.log(`🔌 AssemblyAI closed: ${code}`);
     });
 }
 
@@ -1280,18 +1610,16 @@ async function handleAssemblyAIMessage(data, meetingUuid) {
     const msgType = data.type;
 
     if (msgType === "Begin") {
-        console.log(`🚀 AssemblyAI session started: ${data.id}`);
+        console.log(`🚀 Transcription session started`);
         global.liveTranscripts = [];
     } else if (msgType === "Turn") {
         const transcript = data.transcript || "";
         const formatted = data.turn_is_formatted;
 
         if (formatted && transcript.trim()) {
-            // Add speaker label to transcript
             const speakerRole = speakerMapping.get(currentSpeakerId) || `Speaker ${currentSpeakerId}`;
             const labeledTranscript = `${speakerRole}: ${transcript}`;
             
-            // Add to live transcripts with speaker info
             global.liveTranscripts.push({
                 timestamp: new Date().toLocaleTimeString(),
                 text: labeledTranscript,
@@ -1300,47 +1628,39 @@ async function handleAssemblyAIMessage(data, meetingUuid) {
                 type: 'final'
             });
             
-            // Keep only last 50 entries
             if (global.liveTranscripts.length > 50) {
                 global.liveTranscripts = global.liveTranscripts.slice(-50);
             }
             
-            process.stdout.write('\r' + ' '.repeat(100) + '\r');
             console.log(`📝 [${speakerRole}] ${transcript}`);
             
-            // Send labeled transcript to AI
-            await processTranscript(labeledTranscript);
-            displayCurrentFinancialData();
+            // Process transcript asynchronously for better performance
+            processTranscript(labeledTranscript).catch(console.error);
         } else if (!formatted && transcript.trim()) {
             const speakerRole = speakerMapping.get(currentSpeakerId) || `Speaker ${currentSpeakerId}`;
-            process.stdout.write(`\r🎙️ [${speakerRole}] ${transcript}`);
+            process.stdout.write(`\r🎙️ [${speakerRole}] ${transcript.substring(0, 80)}...`);
         }
     } else if (msgType === "Termination") {
-        console.log(`\n🏁 AssemblyAI session terminated for ${meetingUuid}`);
-        displayCurrentFinancialData();
+        console.log(`\n🏁 Transcription session ended`);
     }
 }
 
-// Zoom RTMS Functions
+// Zoom RTMS Functions (unchanged from previous version)
 function generateSignature(CLIENT_ID, meetingUuid, streamId, CLIENT_SECRET) {
-    console.log('🔐 Generating signature for RTMS connection');
     const message = `${CLIENT_ID},${meetingUuid},${streamId}`;
     return crypto.createHmac('sha256', CLIENT_SECRET).update(message).digest('hex');
 }
 
 function connectToSignalingWebSocket(meetingUuid, streamId, serverUrl) {
-    console.log(`🔌 Connecting to signaling WebSocket for meeting ${meetingUuid}`);
-
     const ws = new WebSocket(serverUrl);
 
-    // Store connection for cleanup later
     if (!activeConnections.has(meetingUuid)) {
         activeConnections.set(meetingUuid, {});
     }
     activeConnections.get(meetingUuid).signaling = ws;
 
     ws.on('open', () => {
-        console.log(`✅ Signaling WebSocket connection opened for meeting ${meetingUuid}`);
+        console.log(`✅ Signaling connected`);
         const signature = generateSignature(CLIENT_ID, meetingUuid, streamId, CLIENT_SECRET);
 
         const handshake = {
@@ -1350,14 +1670,21 @@ function connectToSignalingWebSocket(meetingUuid, streamId, serverUrl) {
             rtms_stream_id: streamId,
             sequence: Math.floor(Math.random() * 1e9),
             signature,
+            media_type: 1,
+            media_params: {
+                audio: {
+                    data_opt: AUDIO_MULTI_STREAMS,
+                }
+            }
         };
+        
+        if (DEBUG_ENABLED) console.log('📤 Signaling handshake:', JSON.stringify(handshake, null, 2));
         ws.send(JSON.stringify(handshake));
-        console.log('📤 Sent handshake to signaling server');
     });
 
     ws.on('message', (data) => {
         const msg = JSON.parse(data);
-        console.log('📨 Signaling Message:', JSON.stringify(msg, null, 2));
+        if (DEBUG_ENABLED) console.log('📨 Signaling:', JSON.stringify(msg, null, 2));
 
         if (msg.msg_type === 2 && msg.status_code === 0) {
             const mediaUrl = msg.media_server?.server_urls?.audio || msg.media_server?.server_urls?.all;
@@ -1367,20 +1694,19 @@ function connectToSignalingWebSocket(meetingUuid, streamId, serverUrl) {
         }
 
         if (msg.msg_type === 12) {
-            const keepAliveResponse = {
+            ws.send(JSON.stringify({
                 msg_type: 13,
                 timestamp: msg.timestamp,
-            };
-            ws.send(JSON.stringify(keepAliveResponse));
+            }));
         }
     });
 
     ws.on('error', (err) => {
-        console.error('❌ Signaling socket error:', err);
+        console.error('❌ Signaling error:', err.message);
     });
 
     ws.on('close', () => {
-        console.log('🔌 Signaling socket closed');
+        if (DEBUG_ENABLED) console.log('🔌 Signaling closed');
         if (activeConnections.has(meetingUuid)) {
             delete activeConnections.get(meetingUuid).signaling;
         }
@@ -1388,17 +1714,14 @@ function connectToSignalingWebSocket(meetingUuid, streamId, serverUrl) {
 }
 
 function connectToMediaWebSocket(mediaUrl, meetingUuid, streamId, signalingSocket) {
-    console.log(`🎵 Connecting to media WebSocket at ${mediaUrl}`);
-
     const mediaWs = new WebSocket(mediaUrl, { rejectUnauthorized: false });
 
-    // Store connection for cleanup later
     if (activeConnections.has(meetingUuid)) {
         activeConnections.get(meetingUuid).media = mediaWs;
     }
 
     mediaWs.on('open', () => {
-        console.log(`✅ Zoom media connected for meeting ${meetingUuid}`);
+        console.log(`✅ Media connected`);
         const signature = generateSignature(CLIENT_ID, meetingUuid, streamId, CLIENT_SECRET);
         
         const handshake = {
@@ -1407,22 +1730,48 @@ function connectToMediaWebSocket(mediaUrl, meetingUuid, streamId, signalingSocke
             meeting_uuid: meetingUuid,
             rtms_stream_id: streamId,
             signature,
-            media_type: 1, // Request raw audio
+            media_type: 1,
             payload_encryption: false,
+            media_params: {
+                audio: {
+                    content_type: 2,
+                    sample_rate: 1,
+                    channel: 1,
+                    codec: 1,
+                    data_opt: 2,
+                    send_rate: 100
+                }
+            }
         };
+        
+        if (DEBUG_ENABLED) console.log('📤 Media handshake:', JSON.stringify(handshake, null, 2));
         mediaWs.send(JSON.stringify(handshake));
     });
 
     mediaWs.on('message', (data) => {
         try {
             const msg = JSON.parse(data.toString());
+            
+            // REMOVED: Excessive media message logging
+            if (DEBUG_ENABLED && msg.msg_type !== 14) {
+                console.log('📦 Media Message:', JSON.stringify(msg, null, 2));
+            }
 
-            if (msg.msg_type === 4 && msg.status_code === 0) {
-                signalingSocket.send(JSON.stringify({
-                    msg_type: 7,
-                    rtms_stream_id: streamId,
-                }));
-                console.log(`🚀 Started audio streaming for meeting ${meetingUuid}`);
+            if (msg.msg_type === 4) {
+                if (msg.status_code === 0) {
+                    signalingSocket.send(JSON.stringify({
+                        msg_type: 7,
+                        rtms_stream_id: streamId,
+                    }));
+                    console.log(`🚀 Multi-stream audio started`);
+                    
+                    if (msg.media_params?.audio?.data_opt !== undefined) {
+                        const dataOpt = msg.media_params.audio.data_opt;
+                        console.log(`🎤 Audio mode: ${dataOpt === 2 ? 'MULTI-STREAMS ✅' : 'MIXED ❌'}`);
+                    }
+                } else {
+                    console.error(`❌ Media handshake failed: ${msg.status_code} - ${msg.reason}`);
+                }
             }
 
             if (msg.msg_type === 12) {
@@ -1432,54 +1781,88 @@ function connectToMediaWebSocket(mediaUrl, meetingUuid, streamId, signalingSocke
                 }));
             }
 
-            // UPDATED: Handle audio data with speaker tracking
+            // OPTIMIZED: Audio data handling without excessive logging
             if (msg.msg_type === 14 && msg.content?.data) {
                 const speakerId = msg.content.user_id !== undefined ? msg.content.user_id : 0;
+                
+                // Only log new users, not every audio packet
+                if (!speakerTracking.detectedUsers.has(speakerId)) {
+                    console.log(`🆔 New user detected: ${speakerId}`);
+                }
+                
                 handleAudioDataWithSpeaker(msg.content.data, meetingUuid, speakerId);
             }
 
         } catch (err) {
-            console.log('📦 Received non-JSON data (should not happen with new format)');
+            // Ignore non-JSON audio data packets silently
         }
     });
 
     mediaWs.on('error', (err) => {
-        console.error('❌ Media socket error:', err);
+        console.error('❌ Media error:', err.message);
     });
 
     mediaWs.on('close', () => {
-        console.log('🔌 Media socket closed');
+        if (DEBUG_ENABLED) console.log('🔌 Media closed');
         if (activeConnections.has(meetingUuid)) {
             delete activeConnections.get(meetingUuid).media;
         }
     });
 }
 
-// ENHANCED: Speaker tracking with better solo testing support
+// OPTIMIZED: Speaker tracking with reduced logging
 function handleAudioDataWithSpeaker(base64Data, meetingUuid, speakerId) {
     const collector = audioCollectors.get(meetingUuid);
     if (!collector || collector.stopRequested) return;
 
-    // Track new speakers
-    if (!detectedSpeakers.has(speakerId)) {
-        detectedSpeakers.add(speakerId);
-        console.log(`👤 New speaker detected: ${speakerId}`);
+    const now = Date.now();
+    
+    // Enhanced user tracking
+    if (!speakerTracking.detectedUsers.has(speakerId)) {
+        speakerTracking.detectedUsers.set(speakerId, {
+            firstSeen: now,
+            lastSeen: now,
+            audioChunks: 0,
+            role: 'Unassigned'
+        });
         
-        // For solo testing, auto-assign as Consultant first
-        if (speakerMapping.size === 0) {
+        logSpeakerEvent('NEW_USER_DETECTED', {
+            speakerId,
+            totalUsers: speakerTracking.detectedUsers.size,
+            detectionOrder: Array.from(speakerTracking.detectedUsers.keys())
+        });
+        
+        // Auto-assign roles
+        if (speakerTracking.detectedUsers.size === 1) {
             speakerMapping.set(speakerId, 'Consultant');
-            console.log(`🏢 Auto-assigned Speaker ${speakerId} as Consultant`);
+            speakerTracking.detectedUsers.get(speakerId).role = 'Consultant';
+            logSpeakerEvent('AUTO_ASSIGNED_CONSULTANT', { speakerId });
+        } else if (speakerTracking.detectedUsers.size === 2) {
+            speakerMapping.set(speakerId, 'Client');
+            speakerTracking.detectedUsers.get(speakerId).role = 'Client';
+            logSpeakerEvent('AUTO_ASSIGNED_CLIENT', { speakerId });
         }
+        
+        detectedSpeakers.add(speakerId);
     }
+    
+    // Update user activity
+    const userInfo = speakerTracking.detectedUsers.get(speakerId);
+    userInfo.lastSeen = now;
+    userInfo.audioChunks++;
 
-    // Track speaker changes (including first time setting)
+    // Track speaker changes
     if (currentSpeakerId !== speakerId) {
+        const previousSpeaker = currentSpeakerId;
         currentSpeakerId = speakerId;
-        const role = speakerMapping.get(speakerId) || `Speaker ${speakerId}`;
-        console.log(`🎙️ Speaker changed to: ${role} (ID: ${speakerId})`);
+        
+        logSpeakerEvent('SPEAKER_CHANGE', {
+            from: { id: previousSpeaker, role: speakerMapping.get(previousSpeaker) },
+            to: { id: speakerId, role: speakerMapping.get(speakerId) }
+        });
     }
 
-    // Continue with existing audio processing
+    // Process audio
     const audioBuffer = Buffer.from(base64Data, 'base64');
     collector.audioChunks.push(audioBuffer);
     collector.totalBytes += audioBuffer.length;
@@ -1487,10 +1870,10 @@ function handleAudioDataWithSpeaker(base64Data, meetingUuid, speakerId) {
 
     sendToAssemblyAI(audioBuffer, meetingUuid);
 
-    if (collector.chunkCount % 100 === 0) {
+    // REDUCED: Less frequent logging
+    if (collector.chunkCount % 200 === 0) {
         const duration = (Date.now() - collector.startTime) / 1000;
-        const role = speakerMapping.get(speakerId) || `Speaker ${speakerId}`;
-        console.log(`🎵 [${role}] ${collector.chunkCount} chunks, ${collector.totalBytes} bytes, ${duration.toFixed(1)}s`);
+        console.log(`📊 Audio: ${collector.chunkCount} chunks, ${(collector.totalBytes / 1024).toFixed(1)}KB, ${duration.toFixed(1)}s`);
     }
 }
 
@@ -1498,13 +1881,10 @@ function sendToAssemblyAI(audioData, meetingUuid) {
     const collector = audioCollectors.get(meetingUuid);
     if (!collector || !collector.streamingWs || collector.stopRequested) return;
 
-    // Add to buffer
     collector.audioBuffer.push(audioData);
     
-    // Calculate total buffered size
     const totalBufferedSize = collector.audioBuffer.reduce((sum, chunk) => sum + chunk.length, 0);
     
-    // Send when we have enough data
     if (totalBufferedSize >= TARGET_CHUNK_SIZE) {
         const combinedBuffer = Buffer.concat(collector.audioBuffer);
         const chunkToSend = combinedBuffer.subarray(0, TARGET_CHUNK_SIZE);
@@ -1516,7 +1896,7 @@ function sendToAssemblyAI(audioData, meetingUuid) {
             try {
                 collector.streamingWs.send(chunkToSend);
             } catch (error) {
-                console.error(`❌ Error sending to AssemblyAI: ${error}`);
+                console.error(`❌ Error sending to AssemblyAI: ${error.message}`);
             }
         }
     }
@@ -1527,14 +1907,14 @@ function flushAudioBuffer(meetingUuid) {
     if (!collector || collector.audioBuffer.length === 0) return;
 
     const combinedBuffer = Buffer.concat(collector.audioBuffer);
-    const minChunkSize = (SAMPLE_RATE * CHANNELS * BYTES_PER_SAMPLE * 50) / 1000; // 50ms minimum
+    const minChunkSize = (SAMPLE_RATE * CHANNELS * BYTES_PER_SAMPLE * 50) / 1000;
     
     if (combinedBuffer.length >= minChunkSize && collector.streamingWs?.readyState === WebSocket.OPEN) {
         try {
             collector.streamingWs.send(combinedBuffer);
-            console.log(`🔄 Flushed remaining audio for meeting ${meetingUuid}`);
+            console.log(`🔄 Flushed audio buffer`);
         } catch (error) {
-            console.error(`❌ Error flushing audio: ${error}`);
+            console.error(`❌ Error flushing: ${error.message}`);
         }
     }
     
@@ -1545,15 +1925,11 @@ async function cleanupMeeting(meetingUuid) {
     const collector = audioCollectors.get(meetingUuid);
     if (!collector) return;
 
-    console.log(`🧹 Cleaning up meeting ${meetingUuid}`);
+    console.log(`🧹 Cleaning up meeting`);
     
-    // Stop streaming
     collector.stopRequested = true;
-    
-    // Flush remaining audio
     flushAudioBuffer(meetingUuid);
     
-    // Close AssemblyAI connection
     if (collector.streamingWs) {
         try {
             if (collector.streamingWs.readyState === WebSocket.OPEN) {
@@ -1565,11 +1941,10 @@ async function cleanupMeeting(meetingUuid) {
                 }
             }, 1000);
         } catch (error) {
-            console.error(`❌ Error closing AssemblyAI: ${error}`);
+            console.error(`❌ Error closing AssemblyAI: ${error.message}`);
         }
     }
 
-    // Close Zoom connections
     if (activeConnections.has(meetingUuid)) {
         const connections = activeConnections.get(meetingUuid);
         for (const conn of Object.values(connections)) {
@@ -1580,181 +1955,156 @@ async function cleanupMeeting(meetingUuid) {
         activeConnections.delete(meetingUuid);
     }
 
-    // Optional: Save audio file for backup/analysis
     if (collector.audioChunks.length > 0) {
-        await processRecordedAudio(meetingUuid, collector.audioChunks);
+        processRecordedAudio(meetingUuid, collector.audioChunks).catch(console.error);
     }
 
-    // Cleanup collector
     audioCollectors.delete(meetingUuid);
 }
 
-// AI Analysis Functions
-function getSystemPrompt(callContext) {
-  return `You are an expert financial consultation analyst monitoring an ongoing financial advisory conversation in real-time. 
-    Your role is to provide valuable insights to the financial advisor by analyzing the consultation as it unfolds. 
-    Only make updates that help the advisor better serve their client. The insights you are providing should be regarding the client.
+// OPTIMIZED: Shorter system prompt for faster Claude processing
+function getSystemPrompt() {
+  return `Financial consultation analyst. Extract key financial information and provide advisor insights. Focus on FAINT qualification (Funds, Authority, Interest, Need, Timing), client concerns, and strategic questions. Be concise.
 
-    The conversation is labeled with speakers (Consultant: or Client:) to help you understand who is speaking.
-    You should focus on identifying key information about the client's financial situation, goals, concerns, and opportunities while 
-    maintaining an organized understanding of the consultation's progress.
-    
-    Pay special attention to:
-    - Financial capacity and assets (Funds)
-    - Decision-making authority (Authority) 
-    - Level of engagement and investment appetite (Interest)
-    - Financial goals and problems to solve (Need)
-    - Timeline for financial decisions (Timing)
-    - Client concerns, fears, or hesitations about financial products/decisions
-    - Opportunities for the advisor to provide value
-    - Information gaps where strategic questions could help gather more useful data
-    
-    ${callContext ? `\nAdditional context for this specific consultation: ${callContext}` : ''}`;
+          IMPORTANT: When updating FAINT data, only include fields with NEW or CHANGED information. Do not include fields that haven't been mentioned or discussed. Preserve existing FAINT data.`;
 }
 
 async function executeToolAndGetResult(toolUse) {
   switch (toolUse.name) {
     case 'update_summary':
       financialData.summary.push(toolUse.input.new_point);
-      logFinancialUpdate('CONSULTATION SUMMARY UPDATE', toolUse.input.new_point);
+      if (DEBUG_ENABLED) console.log(`💰 Summary: ${toolUse.input.new_point}`);
       return {
         type: 'tool_result',
         tool_use_id: toolUse.id,
-        content: "Summary point added successfully"
+        content: "Added"
       };
     case 'update_faint':
-      financialData.faint = { ...financialData.faint, ...toolUse.input };
-      logFinancialUpdate('FAINT QUALIFICATION UPDATE', toolUse.input);
+      // Only update fields that are provided and not empty
+      Object.keys(toolUse.input).forEach(key => {
+        if (toolUse.input[key] && toolUse.input[key].trim() !== '' && toolUse.input[key] !== 'Not identified') {
+          financialData.faint[key] = toolUse.input[key];
+        }
+      });
+      if (DEBUG_ENABLED) console.log(`💎 FAINT updated:`, toolUse.input);
       return {
         type: 'tool_result',
         tool_use_id: toolUse.id,
-        content: "FAINT information updated successfully"
+        content: "Updated"
       };
     case 'update_client_info':
-      financialData.clientInfo = toolUse.input.clientInfo;
-      logFinancialUpdate('CLIENT INFO UPDATE', toolUse.input.clientInfo);
+      financialData.clientInfo.push(toolUse.input.new_info);
+      if (DEBUG_ENABLED) console.log(`👤 Client info: ${toolUse.input.new_info}`);
       return {
         type: 'tool_result',
         tool_use_id: toolUse.id,
-        content: "Client information updated successfully"
+        content: "Added"
       };
     case 'update_advisor_reminders':
       financialData.advisorReminders.push(toolUse.input.new_reminder);
-      logFinancialUpdate('ADVISOR REMINDER', toolUse.input.new_reminder);
+      if (DEBUG_ENABLED) console.log(`💡 Reminder: ${toolUse.input.new_reminder}`);
       return {
         type: 'tool_result',
         tool_use_id: toolUse.id,
-        content: "Advisor reminder added successfully"
+        content: "Added"
       };
     case 'update_concerns':
       financialData.concerns.push(toolUse.input.new_concern);
-      logFinancialUpdate('CLIENT CONCERN IDENTIFIED', toolUse.input.new_concern);
+      if (DEBUG_ENABLED) console.log(`⚠️ Concern: ${toolUse.input.new_concern.concern}`);
       return {
         type: 'tool_result',
         tool_use_id: toolUse.id,
-        content: "New concern added successfully"
+        content: "Added"
       };
     case 'update_strategic_questions':
       financialData.strategicQuestions.push(toolUse.input.new_question);
-      logFinancialUpdate('STRATEGIC QUESTION SUGGESTED', toolUse.input.new_question);
+      if (DEBUG_ENABLED) console.log(`❓ Question: ${toolUse.input.new_question.question}`);
       return {
         type: 'tool_result',
         tool_use_id: toolUse.id,
-        content: "Strategic question added successfully"
+        content: "Added"
       };
     default:
       return {
         type: 'tool_result',
         tool_use_id: toolUse.id,
-        content: "Tool execution completed"
+        content: "Done"
       };
   }
 }
 
-function logFinancialUpdate(type, data) {
-  console.log('\n' + '='.repeat(60));
-  console.log(`💰 ${type} - ${new Date().toLocaleTimeString()}`);
-  console.log('='.repeat(60));
-  
-  if (typeof data === 'object') {
-    console.log(JSON.stringify(data, null, 2));
-  } else {
-    console.log(data);
-  }
-  
-  console.log('='.repeat(60) + '\n');
-}
-
+// SIMPLIFIED: Financial display (only show when debug enabled)
 function displayCurrentFinancialData() {
-  console.log('\n' + '█'.repeat(80));
-  console.log('💼 FINANCIAL CONSULTATION INTELLIGENCE DASHBOARD');
-  console.log('█'.repeat(80));
+  if (!DEBUG_ENABLED) return;
   
-  console.log('\n📝 CONSULTATION SUMMARY:');
-  if (financialData.summary.length > 0) {
-    financialData.summary.forEach((point, index) => {
-      console.log(`  ${index + 1}. ${point}`);
-    });
-  } else {
-    console.log('  No key points identified yet');
-  }
-  
-  console.log('\n💎 FAINT QUALIFICATION:');
-  console.log(`  Funds:     ${financialData.faint.funds}`);
-  console.log(`  Authority: ${financialData.faint.authority}`);
-  console.log(`  Interest:  ${financialData.faint.interest}`);
-  console.log(`  Need:      ${financialData.faint.need}`);
-  console.log(`  Timing:    ${financialData.faint.timing}`);
-  
-  console.log('\n👤 CLIENT INFO:');
-  console.log(`  ${financialData.clientInfo}`);
-  
-  console.log('\n💡 ADVISOR REMINDERS:');
-  if (financialData.advisorReminders.length > 0) {
-    financialData.advisorReminders.forEach((reminder, index) => {
-      console.log(`  ${index + 1}. ${reminder}`);
-    });
-  } else {
-    console.log('  No reminders yet');
-  }
-  
-  console.log('\n⚠️  CLIENT CONCERNS & ADDRESSING:');
-  if (financialData.concerns.length > 0) {
-    financialData.concerns.forEach((concern, index) => {
-      console.log(`  ${index + 1}. Concern: ${concern.concern}`);
-      console.log(`     Strategy: ${concern.addressing_strategy}`);
-    });
-  } else {
-    console.log('  No concerns identified yet');
-  }
-  
-  console.log('\n❓ STRATEGIC QUESTIONS TO ASK:');
-  if (financialData.strategicQuestions.length > 0) {
-    financialData.strategicQuestions.forEach((question, index) => {
-      console.log(`  ${index + 1}. Question: "${question.question}"`);
-      console.log(`     Purpose: ${question.purpose}`);
-    });
-  } else {
-    console.log('  No strategic questions suggested yet');
-  }
-  
-  console.log('\n' + '█'.repeat(80) + '\n');
+  console.log('\n💼 FINANCIAL DASHBOARD UPDATE');
+  console.log(`Summary points: ${financialData.summary.length}`);
+  console.log(`FAINT data: ${Object.values(financialData.faint).filter(v => v !== "Not identified").length}/5`);
+  console.log(`Client info items: ${financialData.clientInfo.length}`);
+  console.log(`Reminders: ${financialData.advisorReminders.length}`);
+  console.log(`Concerns: ${financialData.concerns.length}`);
+  console.log(`Strategic questions: ${financialData.strategicQuestions.length}\n`);
 }
 
+// NEW: Function to validate and clean conversation history
+function validateAndCleanHistory(history) {
+  const cleaned = [];
+  
+  for (let i = 0; i < history.length; i++) {
+    const msg = history[i];
+    
+    // If this is a tool result message, make sure there's a corresponding tool use
+    if (msg.role === "user" && Array.isArray(msg.content)) {
+      // Check if previous message is assistant with tool_use
+      const prevMsg = cleaned[cleaned.length - 1];
+      if (prevMsg && prevMsg.role === "assistant" && Array.isArray(prevMsg.content)) {
+        const hasToolUse = prevMsg.content.some(content => content.type === 'tool_use');
+        if (hasToolUse) {
+          // Valid tool result, include it
+          cleaned.push(msg);
+        }
+        // Skip if no corresponding tool use
+      }
+      // Skip tool results without proper tool use
+    } else if (msg.role === "assistant" && Array.isArray(msg.content)) {
+      // Assistant message with tool use - always include
+      cleaned.push(msg);
+    } else if (typeof msg.content === "string" && msg.content.trim()) {
+      // Regular text message - always include
+      cleaned.push(msg);
+    }
+  }
+  
+  return cleaned;
+}
+
+// FIXED: Claude processing with proper conversation history management
 async function processTranscript(transcript) {
   if (!transcript.trim()) return;
-  
-  console.log('\n🔍 Processing transcript for financial consultation insights...');
-  console.log(`Transcript: "${transcript}"`);
   
   try {
     const userMessage = {
       role: "user",
-      content: `New consultation segment: ${transcript}`
+      content: transcript
     };
     conversationHistory.push(userMessage);
 
-    // Filter out empty messages
+    // FIXED: Proper conversation history cleanup - preserve tool use/result pairs
+    if (conversationHistory.length > 30) {
+      // Find a safe truncation point that doesn't break tool pairs
+      let safeStartIndex = 0;
+      for (let i = conversationHistory.length - 20; i >= 0; i--) {
+        const msg = conversationHistory[i];
+        // Look for a user message that doesn't contain tool results
+        if (msg.role === "user" && !Array.isArray(msg.content)) {
+          safeStartIndex = i;
+          break;
+        }
+      }
+      conversationHistory = conversationHistory.slice(safeStartIndex);
+    }
+
+    // Filter out invalid messages more carefully
     const validHistory = conversationHistory.filter(msg => {
       if (Array.isArray(msg.content)) {
         return msg.content.length > 0;
@@ -1762,12 +2112,15 @@ async function processTranscript(transcript) {
       return msg.content && msg.content.trim().length > 0;
     });
 
+    // ADDITIONAL FIX: Validate conversation history for tool pairs
+    const cleanHistory = validateAndCleanHistory(validHistory);
+
     let message = await anthropic.messages.create({
       model: "claude-3-5-sonnet-20241022",
-      max_tokens: 1024,
+      max_tokens: 512,
       system: getSystemPrompt(),
       tools: TOOLS,
-      messages: validHistory
+      messages: cleanHistory
     });
 
     // Process tool uses
@@ -1795,7 +2148,7 @@ async function processTranscript(transcript) {
         });
       }
 
-      // Get next message
+      // Clean history again before next API call
       const validHistoryAfterTools = conversationHistory.filter(msg => {
         if (Array.isArray(msg.content)) {
           return msg.content.length > 0;
@@ -1803,12 +2156,14 @@ async function processTranscript(transcript) {
         return msg.content && msg.content.trim().length > 0;
       });
 
+      const cleanHistoryAfterTools = validateAndCleanHistory(validHistoryAfterTools);
+
       message = await anthropic.messages.create({
         model: "claude-3-5-sonnet-20241022",
-        max_tokens: 1024,
+        max_tokens: 512,
         system: getSystemPrompt(),
         tools: TOOLS,
-        messages: validHistoryAfterTools
+        messages: cleanHistoryAfterTools
       });
     }
 
@@ -1819,27 +2174,37 @@ async function processTranscript(transcript) {
       });
     }
 
-    // Save consultation logs
-    if (!fs.existsSync('./consultation_logs')) {
-      fs.mkdirSync('./consultation_logs');
+    // Only save logs in debug mode
+    if (DEBUG_ENABLED) {
+      if (!fs.existsSync('./consultation_logs')) {
+        fs.mkdirSync('./consultation_logs');
+      }
+      fs.writeFileSync(
+        `./consultation_logs/${conversationId}.json`, 
+        JSON.stringify({
+          conversationHistory,
+          financialData,
+          timestamp: new Date().toISOString()
+        }, null, 2)
+      );
     }
-    fs.writeFileSync(
-      `./consultation_logs/${conversationId}.json`, 
-      JSON.stringify({
-        conversationHistory,
-        financialData,
-        timestamp: new Date().toISOString()
-      }, null, 2)
-    );
 
   } catch (error) {
-    console.error('❌ Error processing transcript:', error);
+    console.error('❌ Claude processing error:', error.message);
+    
+    // FALLBACK: If there's still an error, reset conversation history
+    if (error.message.includes('tool_use_id') || error.message.includes('tool_result')) {
+      console.log('🔄 Resetting conversation history due to tool pairing error');
+      conversationHistory = conversationHistory.filter(msg => 
+        msg.role === "user" && typeof msg.content === "string"
+      ).slice(-5); // Keep only last 5 simple user messages
+    }
   }
 }
 
 async function processRecordedAudio(meetingId, audioChunks) {
   if (audioChunks.length === 0) {
-    console.log("❌ No audio data received");
+    console.log("❌ No audio data");
     return;
   }
 
@@ -1851,49 +2216,46 @@ async function processRecordedAudio(meetingId, audioChunks) {
     fs.writeFileSync(rawFilename, combinedBuffer);
 
     await convertRawToWav(rawFilename, wavFilename);
-    console.log("🎵 WAV saved: ", wavFilename);
+    console.log("🎵 WAV saved");
 
-    console.log("📄 Starting post-consultation transcription for backup...");
-    
-    const client = new AssemblyAI({
-      apiKey: process.env.ASSEMBLYAI_API_KEY,
-    });
-    
-    const transcript = await client.transcripts.transcribe({
-      audio: wavFilename,
-    });
+    if (DEBUG_ENABLED) {
+      console.log("📄 Starting backup transcription...");
+      
+      const client = new AssemblyAI({
+        apiKey: process.env.ASSEMBLYAI_API_KEY,
+      });
+      
+      const transcript = await client.transcripts.transcribe({
+        audio: wavFilename,
+      });
 
-    if (transcript.status === "error") {
-      console.error(`❌ Post-consultation transcription failed: ${transcript.error}`);
-    } else {
-      console.log("✅ Post-consultation transcription completed");
-      
-      // Save final report
-      const finalReport = {
-        meetingId,
-        timestamp: new Date().toISOString(),
-        financialData,
-        conversationHistory,
-        speakerMapping: Array.from(speakerMapping.entries()),
-        fullTranscript: transcript.text
-      };
-      
-      fs.writeFileSync(
-        `./consultation_logs/${meetingId}_final_report.json`, 
-        JSON.stringify(finalReport, null, 2)
-      );
-      
-      console.log(`📊 Final consultation report saved: ./consultation_logs/${meetingId}_final_report.json`);
+      if (transcript.status === "error") {
+        console.error(`❌ Backup transcription failed: ${transcript.error}`);
+      } else {
+        console.log("✅ Backup transcription completed");
+        
+        const finalReport = {
+          meetingId,
+          timestamp: new Date().toISOString(),
+          financialData,
+          speakerMapping: Array.from(speakerMapping.entries()),
+          fullTranscript: transcript.text
+        };
+        
+        fs.writeFileSync(
+          `./consultation_logs/${meetingId}_final_report.json`, 
+          JSON.stringify(finalReport, null, 2)
+        );
+      }
     }
   } catch (error) {
-    console.error("❌ Post-consultation transcription error:", error);
+    console.error("❌ Audio processing error:", error.message);
   } finally {
-    // Cleanup
     try {
       if (fs.existsSync(rawFilename)) fs.unlinkSync(rawFilename);
       if (fs.existsSync(wavFilename)) fs.unlinkSync(wavFilename);
     } catch (e) {
-      console.error("❌ Error cleaning up audio files:", e);
+      console.error("❌ Cleanup error:", e.message);
     }
   }
 }
@@ -1907,39 +2269,36 @@ async function convertRawToWav(rawFilename, wavFilename) {
 // Start the server
 const server = app.listen(PORT, () => {
   console.log(`🌐 Financial Consultation Intelligence System running at http://localhost:${PORT}`);
-  console.log(`🔗 Webhook endpoint at http://localhost:${PORT}/webhook`);
-  console.log(`🐛 Debug mode available at http://localhost:${PORT}/?debug=1`);
-  console.log(`🔍 Debug API at http://localhost:${PORT}/api/debug/speakers`);
-  console.log('💡 Make sure your environment variables are set in .env\n');
+  console.log(`🔗 Webhook: http://localhost:${PORT}/webhook`);
+  console.log(`🐛 Debug mode: ${DEBUG_ENABLED ? 'ENABLED' : 'DISABLED'}`);
+  console.log('📋 UI UPDATES: Client info as running list, configurable intervals, pause button\n');
 });
 
 // Handle graceful shutdown
 process.on("SIGINT", () => {
-  console.log("\n🛑 Ctrl+C received. Stopping...");
+  console.log("\n🛑 Shutting down...");
   
-  // Clean up all active meetings
   for (const [meetingId] of audioCollectors.entries()) {
     cleanupMeeting(meetingId);
   }
   
-  setTimeout(() => process.exit(0), 2000);
+  setTimeout(() => process.exit(0), 1000);
 });
 
 process.on("SIGTERM", () => {
-  console.log("\n🛑 Termination signal received. Stopping...");
+  console.log("\n🛑 Terminating...");
   
-  // Clean up all active meetings
   for (const [meetingId] of audioCollectors.entries()) {
     cleanupMeeting(meetingId);
   }
   
-  setTimeout(() => process.exit(0), 2000);
+  setTimeout(() => process.exit(0), 1000);
 });
 
 process.on("uncaughtException", (error) => {
-  console.error(`\n❌ Uncaught exception: ${error}`);
-  setTimeout(() => process.exit(1), 1000);
+  console.error(`\n❌ Uncaught exception: ${error.message}`);
+  setTimeout(() => process.exit(1), 500);
 });
 
-console.log('\n💼 ZOOM FINANCIAL CONSULTATION INTELLIGENCE SYSTEM STARTED');
-console.log('🤖 Ready to analyze financial consultations...');
+console.log('\n💼 ZOOM FINANCIAL CONSULTATION INTELLIGENCE SYSTEM');
+console.log('📋 ENHANCED UI: Client info as running list, configurable intervals with pause/resume');
