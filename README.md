@@ -2,11 +2,6 @@
 
 This project demonstrates how to build an AI-powered financial consultation assistant using Zoom's RTMS (Real-Time Media Streaming) with AssemblyAI's Universal Streaming v3 and Anthropic's Claude for real-time conversation analysis.
 
-> [!IMPORTANT]
-> **Confidential under NDA - Do not distribute during developer preview**<br />
-> This document contains confidential information that requires an NDA. It is intended only for partners in the Zoom RTMS developer preview.
-> Participation in the RTMS Developer Preview, including access to and use of these materials, is subject to [Zoom's Beta Program - Terms of Use](https://www.zoom.com/en/trust/beta-terms-and-conditions/).
-
 ## 🎯 What This System Does
 
 This intelligent assistant monitors financial consultation conversations in real-time and provides:
