@@ -78,7 +78,7 @@ Configure the following URLs in your Zoom App:
 ### Installation
 
 ```bash
-git clone https://github.com/zkleb-aai/rtms_assist_demo.git
+git clone https://github.com/AssemblyAI-Solutions/rtms_assist_demo.git
 cd rtms_assist_demo
 npm install
 ```
