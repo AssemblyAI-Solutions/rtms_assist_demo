@@ -1,5 +1,7 @@
 # RTMS Financial Consultation Intelligence - Node.js
 
+> 🧠 This demo was presented at the **Zoom Developer Summit 2025**.
+
 This project demonstrates how to build an AI-powered financial consultation assistant using Zoom's RTMS (Real-Time Media Streaming) with AssemblyAI's Universal Streaming v3 and Anthropic's Claude for real-time conversation analysis.
 
 ## 🎯 What This System Does
