@@ -63,7 +63,7 @@ const anthropic = new Anthropic({
   apiKey: process.env.ANTHROPIC_API_KEY,
 });
 
-// Store conversation data
+// Store conversation data with safe initialization
 let conversationHistory = [];
 let conversationId = null;
 let financialData = {
@@ -172,6 +172,42 @@ function logSpeakerEvent(event, data) {
   if (speakerTracking.speakerTransitions.length > 50) {
     speakerTracking.speakerTransitions = speakerTracking.speakerTransitions.slice(-25);
   }
+}
+
+// Safe function to initialize financial data
+function initializeFinancialData() {
+  return {
+    summary: [],
+    faint: {
+      funds: "Not identified",
+      authority: "Not identified", 
+      interest: "Not identified",
+      need: "Not identified",
+      timing: "Not identified"
+    },
+    clientInfo: [],
+    advisorReminders: [],
+    concerns: [],
+    strategicQuestions: []
+  };
+}
+
+// Safe function to get financial data with fallbacks
+function getSafeFinancialData() {
+  return {
+    summary: financialData.summary || [],
+    faint: financialData.faint || {
+      funds: "Not identified",
+      authority: "Not identified", 
+      interest: "Not identified",
+      need: "Not identified",
+      timing: "Not identified"
+    },
+    clientInfo: financialData.clientInfo || [],
+    advisorReminders: financialData.advisorReminders || [],
+    concerns: financialData.concerns || [],
+    strategicQuestions: financialData.strategicQuestions || []
+  };
 }
 
 // Optimized Financial Consultation Tools (reduced descriptions for faster processing)
@@ -1162,6 +1198,20 @@ app.get('/', (req, res) => {
             function updateFinancialDashboard(data) {
                 const dashboard = document.getElementById('financial-dashboard');
                 
+                // FIXED: Add defensive checks for all data properties
+                const summary = data.summary || [];
+                const faint = data.faint || {
+                    funds: "Not identified",
+                    authority: "Not identified", 
+                    interest: "Not identified",
+                    need: "Not identified",
+                    timing: "Not identified"
+                };
+                const clientInfo = data.clientInfo || [];
+                const advisorReminders = data.advisorReminders || [];
+                const concerns = data.concerns || [];
+                const strategicQuestions = data.strategicQuestions || [];
+                
                 // Helper function to create collapsible section
                 function createCollapsibleSection(sectionId, title, items, renderItem, emptyMessage) {
                     if (!items || items.length === 0) {
@@ -1208,26 +1258,26 @@ app.get('/', (req, res) => {
                         <div class="section-title">💎 FAINT Qualification</div>
                         <div class="faint-grid">
                             <div class="faint-label">💰 Funds:</div>
-                            <div class="faint-value">\${data.faint?.funds || 'Not identified'}</div>
+                            <div class="faint-value">\${faint.funds || 'Not identified'}</div>
                             
                             <div class="faint-label">👤 Authority:</div>
-                            <div class="faint-value">\${data.faint?.authority || 'Not identified'}</div>
+                            <div class="faint-value">\${faint.authority || 'Not identified'}</div>
                             
                             <div class="faint-label">🎯 Interest:</div>
-                            <div class="faint-value">\${data.faint?.interest || 'Not identified'}</div>
+                            <div class="faint-value">\${faint.interest || 'Not identified'}</div>
                             
                             <div class="faint-label">🎪 Need:</div>
-                            <div class="faint-value">\${data.faint?.need || 'Not identified'}</div>
+                            <div class="faint-value">\${faint.need || 'Not identified'}</div>
                             
                             <div class="faint-label">⏰ Timing:</div>
-                            <div class="faint-value">\${data.faint?.timing || 'Not identified'}</div>
+                            <div class="faint-value">\${faint.timing || 'Not identified'}</div>
                         </div>
                     </div>
 
                     \${createCollapsibleSection(
                         'clientInfo',
                         '👤 Client Information',
-                        data.clientInfo,
+                        clientInfo,
                         (info, index, isLatest) => \`<div class="list-item \${isLatest ? 'latest' : ''}">\${index + 1}. \${info}</div>\`,
                         'No client information identified yet'
                     )}
@@ -1235,7 +1285,7 @@ app.get('/', (req, res) => {
                     \${createCollapsibleSection(
                         'summary',
                         '📝 Consultation Summary',
-                        data.summary,
+                        summary,
                         (point, index, isLatest) => \`<div class="list-item \${isLatest ? 'latest' : ''}">\${index + 1}. \${point}</div>\`,
                         'No key points identified yet'
                     )}
@@ -1243,7 +1293,7 @@ app.get('/', (req, res) => {
                     \${createCollapsibleSection(
                         'reminders',
                         '💡 Advisor Reminders',
-                        data.advisorReminders,
+                        advisorReminders,
                         (reminder, index, isLatest) => \`<div class="list-item \${isLatest ? 'latest' : ''}">\${index + 1}. \${reminder}</div>\`,
                         'No reminders yet'
                     )}
@@ -1251,11 +1301,11 @@ app.get('/', (req, res) => {
                     \${createCollapsibleSection(
                         'concerns',
                         '⚠️ Client Concerns & Addressing',
-                        data.concerns,
+                        concerns,
                         (concern, index, isLatest) => \`
                             <div class="concern-item \${isLatest ? 'latest' : ''}">
-                                <strong>Concern:</strong> \${concern.concern}<br><br>
-                                <strong>Strategy:</strong> \${concern.addressing_strategy}
+                                <strong>Concern:</strong> \${concern.concern || 'N/A'}<br><br>
+                                <strong>Strategy:</strong> \${concern.addressing_strategy || 'N/A'}
                             </div>
                         \`,
                         'No concerns identified yet'
@@ -1264,11 +1314,11 @@ app.get('/', (req, res) => {
                     \${createCollapsibleSection(
                         'questions',
                         '❓ Strategic Questions to Ask',
-                        data.strategicQuestions,
+                        strategicQuestions,
                         (question, index, isLatest) => \`
                             <div class="question-item \${isLatest ? 'latest' : ''}">
-                                <strong>\${index + 1}. Question:</strong> "\${question.question}"<br><br>
-                                <strong>Purpose:</strong> \${question.purpose}
+                                <strong>\${index + 1}. Question:</strong> "\${question.question || 'N/A'}"<br><br>
+                                <strong>Purpose:</strong> \${question.purpose || 'N/A'}
                             </div>
                         \`,
                         'No strategic questions suggested yet'
@@ -1352,7 +1402,7 @@ app.get('/', (req, res) => {
   `);
 });
 
-// API endpoints (updated for client info as running list)
+// API endpoints (updated with safe data handling)
 app.get('/api/transcript', (req, res) => {
   res.json({
     transcripts: global.liveTranscripts || [],
@@ -1471,10 +1521,13 @@ app.get('/api/status', (req, res) => {
   });
 });
 
+// FIXED: Dashboard API endpoint with safe data handling
 app.get('/api/dashboard', (req, res) => {
+  const safeFinancialData = getSafeFinancialData();
+  
   res.json({
     conversation_id: conversationId,
-    financial_data: financialData,
+    financial_data: safeFinancialData,
     conversation_history_length: conversationHistory.length,
     active_meetings: activeConnections.size,
     timestamp: new Date().toISOString()
@@ -1500,23 +1553,10 @@ app.post('/webhook', (req, res) => {
         console.log('💼 STARTING FINANCIAL CONSULTATION ANALYSIS');
         const { meeting_uuid, rtms_stream_id, server_urls } = payload;
         
-        // Initialize consultation
+        // Initialize consultation with safe data structure
         conversationId = meeting_uuid.replace(/[^a-zA-Z0-9]/g, "_");
         conversationHistory = [];
-        financialData = {
-          summary: [],
-          faint: {
-            funds: "Not identified",
-            authority: "Not identified", 
-            interest: "Not identified",
-            need: "Not identified",
-            timing: "Not identified"
-          },
-          clientInfo: [],
-          advisorReminders: [],
-          concerns: [],
-          strategicQuestions: []
-        };
+        financialData = initializeFinancialData();
         
         // Reset speaker tracking
         speakerMapping.clear();
@@ -1970,6 +2010,25 @@ function getSystemPrompt() {
 }
 
 async function executeToolAndGetResult(toolUse) {
+  // Ensure financialData structure exists
+  if (!financialData) {
+    financialData = initializeFinancialData();
+  }
+  
+  // Ensure arrays exist
+  if (!financialData.summary) financialData.summary = [];
+  if (!financialData.clientInfo) financialData.clientInfo = [];
+  if (!financialData.advisorReminders) financialData.advisorReminders = [];
+  if (!financialData.concerns) financialData.concerns = [];
+  if (!financialData.strategicQuestions) financialData.strategicQuestions = [];
+  if (!financialData.faint) financialData.faint = {
+    funds: "Not identified",
+    authority: "Not identified", 
+    interest: "Not identified",
+    need: "Not identified",
+    timing: "Not identified"
+  };
+  
   switch (toolUse.name) {
     case 'update_summary':
       financialData.summary.push(toolUse.input.new_point);
@@ -2038,12 +2097,12 @@ function displayCurrentFinancialData() {
   if (!DEBUG_ENABLED) return;
   
   console.log('\n💼 FINANCIAL DASHBOARD UPDATE');
-  console.log(`Summary points: ${financialData.summary.length}`);
-  console.log(`FAINT data: ${Object.values(financialData.faint).filter(v => v !== "Not identified").length}/5`);
-  console.log(`Client info items: ${financialData.clientInfo.length}`);
-  console.log(`Reminders: ${financialData.advisorReminders.length}`);
-  console.log(`Concerns: ${financialData.concerns.length}`);
-  console.log(`Strategic questions: ${financialData.strategicQuestions.length}\n`);
+  console.log(`Summary points: ${financialData.summary?.length || 0}`);
+  console.log(`FAINT data: ${Object.values(financialData.faint || {}).filter(v => v !== "Not identified").length}/5`);
+  console.log(`Client info items: ${financialData.clientInfo?.length || 0}`);
+  console.log(`Reminders: ${financialData.advisorReminders?.length || 0}`);
+  console.log(`Concerns: ${financialData.concerns?.length || 0}`);
+  console.log(`Strategic questions: ${financialData.strategicQuestions?.length || 0}\n`);
 }
 
 // NEW: Function to validate and clean conversation history
@@ -2081,6 +2140,11 @@ function validateAndCleanHistory(history) {
 // FIXED: Claude processing with proper conversation history management
 async function processTranscript(transcript) {
   if (!transcript.trim()) return;
+  
+  // Ensure financialData exists
+  if (!financialData) {
+    financialData = initializeFinancialData();
+  }
   
   try {
     const userMessage = {
@@ -2242,6 +2306,10 @@ async function processRecordedAudio(meetingId, audioChunks) {
           fullTranscript: transcript.text
         };
         
+        if (!fs.existsSync('./consultation_logs')) {
+          fs.mkdirSync('./consultation_logs');
+        }
+        
         fs.writeFileSync(
           `./consultation_logs/${meetingId}_final_report.json`, 
           JSON.stringify(finalReport, null, 2)
@@ -2271,7 +2339,7 @@ const server = app.listen(PORT, () => {
   console.log(`🌐 Financial Consultation Intelligence System running at http://localhost:${PORT}`);
   console.log(`🔗 Webhook: http://localhost:${PORT}/webhook`);
   console.log(`🐛 Debug mode: ${DEBUG_ENABLED ? 'ENABLED' : 'DISABLED'}`);
-  console.log('📋 UI UPDATES: Client info as running list, configurable intervals, pause button\n');
+  console.log('📋 FIXED: Questions and concerns undefined issue resolved\n');
 });
 
 // Handle graceful shutdown
@@ -2301,4 +2369,4 @@ process.on("uncaughtException", (error) => {
 });
 
 console.log('\n💼 ZOOM FINANCIAL CONSULTATION INTELLIGENCE SYSTEM');
-console.log('📋 ENHANCED UI: Client info as running list, configurable intervals with pause/resume');
+console.log('🔧 FIXED: Questions and concerns undefined issue resolved with defensive data checks');

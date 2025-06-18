@@ -1,7 +1,7 @@
 {
-  "name": "rtms-developer-preview-js",
+  "name": "rtms-financial-consultation-intelligence",
   "version": "1.0.1",
-  "description": "A simple sample to preview the RTMS Node.js SDK",
+  "description": "AI-powered financial consultation assistant using Zoom RTMS with AssemblyAI and Claude",
   "main": "index.js",
   "type": "module",
   "scripts": {
